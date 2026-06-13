@@ -1,0 +1,75 @@
+# Fleet node — clone, fill .env, `docker compose up -d`. That's the whole setup.
+#
+#   tailscale  — joins the tailnet (kernel mode), advertises this node's app
+#                subnet, accepts other nodes' routes, MagicDNS on.
+#   agent      — shares tailscale's netns; polls the control plane, runs deploys.
+#   router     — adds host routes so app containers on THIS host reach the tailnet
+#                (and other nodes' subnets) THROUGH the tailscale.
+#   fleet-net  — the docker network app bundles deploy into; its subnet is what
+#                the tailscale advertises, so core can reach apps here.
+#
+# After `up`, approve this node's advertised subnet route once in the Tailscale
+# admin console (or set an ACL autoApprover for tag:fleet to skip even that).
+name: fleet
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: fleet-tailscale
+    hostname: ${FLEET_NODE_NAME:?set FLEET_NODE_NAME in .env}
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      TS_USERSPACE: "false"
+      TS_AUTHKEY: ${FLEET_TS_AUTHKEY:?paste this node's Tailscale auth key in .env}
+      TS_HOSTNAME: ${FLEET_NODE_NAME}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_ACCEPT_DNS: "true"
+      TS_ROUTES: ${FLEET_SUBNET:-10.42.0.0/24}
+      TS_EXTRA_ARGS: --accept-routes
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    networks:
+      fleet-net:
+        ipv4_address: ${FLEET_TS_IP:-10.42.0.2}
+    restart: unless-stopped
+  agent:
+    image: ghcr.io/loynazkovacs/fleet-agent:latest
+    container_name: fleet-agent
+    network_mode: "service:tailscale"
+    depends_on: [tailscale]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-id:/data
+    command: ["--core-url", "${FLEET_CORE_URL:?set FLEET_CORE_URL in .env}", "--join-key", "${FLEET_JOIN_KEY:?set FLEET_JOIN_KEY in .env}", "--name", "${FLEET_NODE_NAME}"]
+    restart: unless-stopped
+  router:
+    image: alpine:3.20
+    container_name: fleet-router
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    environment:
+      FLEET_TS_IP: ${FLEET_TS_IP:-10.42.0.2}
+      FLEET_ROUTE_RANGES: ${FLEET_ROUTE_RANGES:-100.64.0.0/10 10.42.0.0/16}
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache iproute2 >/dev/null 2>&1 || true
+        echo "fleet-router: routing [$$FLEET_ROUTE_RANGES] via $$FLEET_TS_IP"
+        while true; do
+          for r in $$FLEET_ROUTE_RANGES; do ip route replace "$$r" via "$$FLEET_TS_IP" 2>/dev/null || true; done
+          sleep 30
+        done
+    restart: unless-stopped
+networks:
+  fleet-net:
+    name: fleet-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${FLEET_SUBNET:-10.42.0.0/24}
+volumes:
+  tailscale-state:
+  agent-id:
