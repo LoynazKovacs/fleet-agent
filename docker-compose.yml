@@ -36,6 +36,7 @@ services:
     restart: unless-stopped
   agent:
     image: ghcr.io/loynazkovacs/fleet-agent:latest
+    pull_policy: always   # always fetch the newest agent on `up` — agents update from master
     container_name: fleet-agent
     network_mode: "service:tailscale"
     depends_on: [tailscale]
