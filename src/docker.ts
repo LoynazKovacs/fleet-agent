@@ -119,11 +119,18 @@ export class DockerClient {
    * `opts.networkAlias` adds a DNS alias for the container on `spec.network` so
    * a bundle's siblings can reach it by its service name even though its actual
    * container name is the deterministic `<app>-<service>-<suffix>`.
+   *
+   * `opts.staticIp` pins the container to a known IPv4 on `spec.network` (so its
+   * reachable address is determinable at create time — used by the bundle path
+   * to resolve `${service.publicUrl}`). `opts.dns` overrides the container's DNS
+   * servers (the bundle path points these at the tailnet MagicDNS resolver so a
+   * deployed app can resolve core's serve name). Both are additive and only set
+   * by the bundle path — the plain single-container `run` path leaves them off.
    */
   async runContainer(
     spec: RunContainerSpec,
     auth?: RegistryAuth,
-    opts?: { networkAlias?: string },
+    opts?: { networkAlias?: string; staticIp?: string; dns?: string[] },
   ): Promise<string> {
     if (spec.pull !== false) {
       await this.pullImage(spec.image, auth);
@@ -152,10 +159,11 @@ export class DockerClient {
 
     const binds = (spec.volumes ?? []).map((v) => `${v.host}:${v.container}${v.readOnly ? ':ro' : ''}`);
 
+    const endpoint: { Aliases?: string[]; IPAMConfig?: { IPv4Address: string } } = {};
+    if (opts?.networkAlias) endpoint.Aliases = [opts.networkAlias];
+    if (opts?.staticIp) endpoint.IPAMConfig = { IPv4Address: opts.staticIp };
     const endpointsConfig =
-      opts?.networkAlias && spec.network
-        ? { [spec.network]: { Aliases: [opts.networkAlias] } }
-        : undefined;
+      spec.network && Object.keys(endpoint).length ? { [spec.network]: endpoint } : undefined;
 
     const container = await this.docker.createContainer({
       Image: spec.image,
@@ -167,6 +175,7 @@ export class DockerClient {
         PortBindings: Object.keys(portBindings).length ? portBindings : undefined,
         Binds: binds.length ? binds : undefined,
         NetworkMode: spec.network,
+        Dns: opts?.dns && opts.dns.length ? opts.dns : undefined,
         RestartPolicy: spec.restart && spec.restart !== 'no' ? { Name: spec.restart } : undefined,
       },
       NetworkingConfig: endpointsConfig ? { EndpointsConfig: endpointsConfig } : undefined,
@@ -188,15 +197,39 @@ export class DockerClient {
    */
   async deployBundle(spec: BundleSpec): Promise<BundleServiceResult[]> {
     await this.ensureNetwork(spec.networkName);
+    // The fleet net's IPAM base (e.g. "10.42.0" from 10.42.0.0/24) — needed to
+    // assign deterministic static IPs that resolve `${service.publicUrl}`. Null
+    // if the network has no inspectable subnet: we then leave the placeholder
+    // literal and skip the static IP (best effort, never crash the deploy).
+    const subnetBase = await this.networkSubnetBase(spec.networkName);
     const ordered = orderServicesByDependsOn(spec.services);
     const results: BundleServiceResult[] = [];
+    // Running index across the services in THIS bundle that use the placeholder,
+    // so the first gets <base>.10, the second <base>.11, and so on.
+    let publicUrlIndex = 0;
     for (const svc of ordered) {
       const containerName = svc.name ?? `${spec.appKey}-${svc.serviceName}`;
       try {
+        let env = svc.env;
+        let staticIp: string | undefined;
+        const usesPublicUrl =
+          !!env && Object.values(env).some((v) => v.includes('${service.publicUrl}'));
+        if (usesPublicUrl && subnetBase) {
+          staticIp = `${subnetBase}.${10 + publicUrlIndex}`;
+          publicUrlIndex += 1;
+          // First published/exposed port is the service's ingress.
+          const port = svc.ports?.[0]?.container;
+          const publicUrl = `http://${staticIp}:${port}`;
+          env = Object.fromEntries(
+            Object.entries(env!).map(([k, v]) => [k, v.replaceAll('${service.publicUrl}', publicUrl)]),
+          );
+        }
         const id = await this.runContainer(
-          { ...svc, name: containerName, network: spec.networkName },
+          { ...svc, name: containerName, network: spec.networkName, env },
           svc.auth,
-          { networkAlias: svc.serviceName },
+          // MagicDNS so the deployed app can resolve core's tailnet serve name;
+          // static IP (when assigned) pins the address baked into publicUrl.
+          { networkAlias: svc.serviceName, staticIp, dns: ['100.100.100.100'] },
         );
         results.push({ serviceName: svc.serviceName, containerName, ok: true, containerId: id });
       } catch (err) {
@@ -204,6 +237,25 @@ export class DockerClient {
       }
     }
     return results;
+  }
+
+  /**
+   * The first three octets of a network's IPAM subnet base (e.g. "10.42.0" from
+   * `10.42.0.0/24`), used to compute deterministic static IPs for bundle
+   * services. Returns null if the network is missing, has no IPAM config, or its
+   * subnet isn't a parseable IPv4 — callers then fall back to no static IP.
+   */
+  private async networkSubnetBase(name: string): Promise<string | null> {
+    try {
+      const net = (await this.docker.getNetwork(name).inspect()) as any;
+      const subnet: string | undefined = net?.IPAM?.Config?.[0]?.Subnet;
+      if (!subnet) return null;
+      const octets = subnet.split('/')[0]?.split('.') ?? [];
+      if (octets.length !== 4) return null;
+      return octets.slice(0, 3).join('.');
+    } catch {
+      return null;
+    }
   }
 
   /**
