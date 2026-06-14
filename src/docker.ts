@@ -198,31 +198,51 @@ export class DockerClient {
   async deployBundle(spec: BundleSpec): Promise<BundleServiceResult[]> {
     await this.ensureNetwork(spec.networkName);
     // The fleet net's IPAM base (e.g. "10.42.0" from 10.42.0.0/24) — needed to
-    // assign deterministic static IPs that resolve `${service.publicUrl}`. Null
-    // if the network has no inspectable subnet: we then leave the placeholder
-    // literal and skip the static IP (best effort, never crash the deploy).
+    // assign deterministic static IPs to the bundle's services. Null if the
+    // network has no inspectable subnet: we then skip static IPs + the endpoints
+    // map and leave any `${service.publicUrl}` literal (best effort, never crash).
     const subnetBase = await this.networkSubnetBase(spec.networkName);
     const ordered = orderServicesByDependsOn(spec.services);
     const results: BundleServiceResult[] = [];
-    // Running index across the services in THIS bundle that use the placeholder,
-    // so the first gets <base>.10, the second <base>.11, and so on.
-    let publicUrlIndex = 0;
+
+    // Assign a deterministic static fleet-net IP to EVERY service up front:
+    //  (a) each service becomes reachable from core at a known address (core's
+    //      Caddy proxies the frontend remote + api over the tailnet), and
+    //  (b) we can hand the registrant a `serviceName -> IP` map so its SDK can
+    //      rewrite manifest route upstreams (docker name → fleet IP).
+    // Index-based + dependsOn-ordered ⇒ stable across re-deploys: first service
+    // gets <base>.10, second <base>.11, … A null subnet (uninspectable network)
+    // ⇒ no static IPs and no endpoints map — co-located fallback where siblings
+    // still resolve each other by docker alias.
+    const ipByService = new Map<string, string>();
+    if (subnetBase) {
+      ordered.forEach((svc, i) => ipByService.set(svc.serviceName, `${subnetBase}.${10 + i}`));
+    }
+    const endpointsJson = ipByService.size
+      ? JSON.stringify(Object.fromEntries(ipByService))
+      : undefined;
+
     for (const svc of ordered) {
       const containerName = svc.name ?? `${spec.appKey}-${svc.serviceName}`;
       try {
+        const staticIp = ipByService.get(svc.serviceName);
         let env = svc.env;
-        let staticIp: string | undefined;
-        const usesPublicUrl =
-          !!env && Object.values(env).some((v) => v.includes('${service.publicUrl}'));
-        if (usesPublicUrl && subnetBase) {
-          staticIp = `${subnetBase}.${10 + publicUrlIndex}`;
-          publicUrlIndex += 1;
-          // First published/exposed port is the service's ingress.
-          const port = svc.ports?.[0]?.container;
-          const publicUrl = `http://${staticIp}:${port}`;
-          env = Object.fromEntries(
-            Object.entries(env!).map(([k, v]) => [k, v.replaceAll('${service.publicUrl}', publicUrl)]),
-          );
+        if (env || endpointsJson) {
+          const next: Record<string, string> = { ...(env ?? {}) };
+          // Resolve this service's OWN `${service.publicUrl}` to its assigned IP
+          // (first exposed port is its ingress; host-only if it has no port).
+          if (staticIp) {
+            const port = svc.ports?.[0]?.container;
+            const publicUrl = port ? `http://${staticIp}:${port}` : `http://${staticIp}`;
+            for (const k of Object.keys(next)) {
+              next[k] = next[k].replaceAll('${service.publicUrl}', publicUrl);
+            }
+          }
+          // Hand every service the bundle's serviceName→fleet-IP map; the
+          // registrant's SDK uses it to rewrite manifest route upstreams.
+          // Harmless on non-registrant services.
+          if (endpointsJson) next.FLEET_SERVICE_ENDPOINTS = endpointsJson;
+          env = next;
         }
         const id = await this.runContainer(
           { ...svc, name: containerName, network: spec.networkName, env },
