@@ -18,8 +18,20 @@ tailscale advertises so core can reach apps here).
 git clone https://github.com/LoynazKovacs/fleet-agent.git
 cd fleet-agent
 cp .env.example .env      # then edit .env and fill the 5 vars below
+
+# One-time: log in to Artifact Registry with a READ-ONLY AR key so the node
+# (and the self-updater) can pull the agent image. Same registry as every other
+# app image — no GHCR, no GitHub token.
+cat ar-readonly-key.json | docker login -u _json_key --password-stdin https://europe-central2-docker.pkg.dev
+
 docker compose up -d
 ```
+
+The agent image lives in **Artifact Registry**
+(`europe-central2-docker.pkg.dev/theitemapp/theitemapp/fleet-agent`), authed with
+a GCP key — the same registry and auth as every other app image. Use a
+**read-only** AR key on nodes (`roles/artifactregistry.reader`), **not** the
+writer/deploy SA.
 
 The five vars in `.env`:
 
@@ -61,13 +73,23 @@ machine. The default `10.42.0.0/24` is only safe for a single node.
 
 ## Updating
 
+**Automatic — zero hands-on at the node.** The bundle ships a `fleet-updater`
+sidecar (watchtower) that watches **only** the agent container. Push a new agent
+image from master → CI builds and pushes it to Artifact Registry → within
+`FLEET_AGENT_UPDATE_INTERVAL` seconds (default 300) every node's updater pulls
+it and recreates the agent in place with the same config. No SSH, no `docker
+compose pull` per node. The updater needs the host's GAR login — point
+`FLEET_DOCKER_CONFIG` at wherever you ran `docker login` (default
+`/root/.docker/config.json`).
+
+Identity (node id + token) lives in the `agent-id` volume and tailscale state in
+`tailscale-state`, so updates never re-enroll the node.
+
+**Manual** (e.g. to also pull a new `tailscale` image):
+
 ```sh
 docker compose pull && docker compose up -d
 ```
-
-Pulls the latest `fleet-agent` and `tailscale` images and recreates the
-containers in place. Identity (node id + token) lives in the `agent-id` volume
-and tailscale state in `tailscale-state`, so updates don't re-enroll the node.
 
 ## Core node
 

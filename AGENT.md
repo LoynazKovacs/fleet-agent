@@ -8,10 +8,12 @@ approved. It contains no platform secrets, so the image is public.
 ## Install (one-liner)
 
 ```sh
+# The image lives in Artifact Registry; log in once with a read-only AR key first:
+#   cat ar-readonly-key.json | docker login -u _json_key --password-stdin https://europe-central2-docker.pkg.dev
 docker run -d --name fleet-agent --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v fleet-agent-id:/data \
-  ghcr.io/loynazkovacs/fleet-agent:latest \
+  europe-central2-docker.pkg.dev/theitemapp/theitemapp/fleet-agent:latest \
   --core-url https://<core-host>/fleet-api \
   --join-key <FLEET_JOIN_KEY> \
   --name <label-for-this-machine>
