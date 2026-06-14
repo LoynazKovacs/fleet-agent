@@ -114,6 +114,69 @@ export class DockerClient {
   }
 
   /**
+   * Update the agent itself to a newer image — driven from the control plane, so
+   * the node never needs its own registry credentials (the whole point of the
+   * brokered-auth model; the watchtower sidecar this replaces could not use it).
+   *
+   * Two steps, because a process cannot recreate its own container (removing it
+   * kills this process mid-operation):
+   *   1. We pull the new image HERE, with the short-lived token the control plane
+   *      attached to the command — the only step that touches the registry.
+   *   2. We launch a DETACHED sibling helper that, after a short delay (so we can
+   *      ack this command on the current poll first), runs `docker compose up`
+   *      for ONLY the `agent` service from the node's repo dir, recreating us
+   *      from the just-pulled local image with `--pull never` (no node creds).
+   *
+   * The helper uses the public `docker:cli` image (compose plugin bundled, no
+   * auth) and the host repo path the compose passes us as `FLEET_COMPOSE_DIR`.
+   * Returns the helper container id. The real success signal is the node's
+   * reported `agentVersion` bumping after the new agent boots.
+   */
+  async selfUpdate(image: string, auth?: RegistryAuth): Promise<string> {
+    if (!image) throw new Error('updateAgent command missing image');
+
+    // Step 1 — authenticated pull of the new agent image (brokered token).
+    await this.pullImage(image, auth);
+
+    // Step 2 — recreate via a detached helper. We need the HOST path of the node
+    // repo (compose file + .env) to run compose against; the compose passes it in
+    // as FLEET_COMPOSE_DIR (`${PWD}` at `docker compose up` time).
+    const composeDir = (process.env.FLEET_COMPOSE_DIR ?? '').trim();
+    if (!composeDir) {
+      throw new Error(
+        'FLEET_COMPOSE_DIR not set — agent cannot self-recreate. Update the node compose (adds it + drops the watchtower sidecar) and run `docker compose up -d` once on the node.',
+      );
+    }
+
+    // The helper image is public — anonymous pull, no node creds.
+    await this.pullImage('docker:cli');
+
+    // Recreate ONLY the agent from the already-pulled local image. `--pull never`
+    // keeps the registry out of the helper's path entirely; `--force-recreate`
+    // guarantees the swap even if compose thinks nothing changed. The leading
+    // sleep lets the current poll deliver this command's result before compose
+    // stops us.
+    const script = `sleep 6; cd "${composeDir}" && docker compose up -d --pull never --force-recreate agent`;
+    const helperName = `fleet-agent-updater-${Date.now().toString(36)}`;
+    const helper = await this.docker.createContainer({
+      Image: 'docker:cli',
+      name: helperName,
+      Cmd: ['sh', '-c', script],
+      WorkingDir: composeDir,
+      HostConfig: {
+        AutoRemove: true,
+        NetworkMode: 'bridge', // own netns — survives the agent's recreation
+        Binds: [
+          '/var/run/docker.sock:/var/run/docker.sock',
+          `${composeDir}:${composeDir}`,
+        ],
+      },
+    });
+    await helper.start();
+    return helper.id.slice(0, 12);
+  }
+
+  /**
    * Create + start a single container from a run spec. Returns its id.
    *
    * `opts.networkAlias` adds a DNS alias for the container on `spec.network` so

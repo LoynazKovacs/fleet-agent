@@ -193,6 +193,16 @@ async function execute(docker: DockerClient, cmd: Command): Promise<CommandResul
         await docker.pullImage(cmd.target, cmd.auth);
         return { id: cmd.id, ok: true, detail: `pulled ${cmd.target}`, finishedAt: finishedAt() };
       }
+      case 'updateAgent': {
+        if (!cmd.target) throw new Error('updateAgent command missing image');
+        const helperId = await docker.selfUpdate(cmd.target, cmd.auth);
+        return {
+          id: cmd.id,
+          ok: true,
+          detail: `pulled ${cmd.target}; recreating agent via helper ${helperId}`,
+          finishedAt: finishedAt(),
+        };
+      }
       case 'deployApp': {
         if (!cmd.bundle) throw new Error('deployApp command missing bundle');
         const services = await docker.deployBundle(cmd.bundle);

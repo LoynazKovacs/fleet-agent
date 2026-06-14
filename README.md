@@ -73,14 +73,20 @@ machine. The default `10.42.0.0/24` is only safe for a single node.
 
 ## Updating
 
-**Automatic — zero hands-on at the node.** The bundle ships a `fleet-updater`
-sidecar (watchtower) that watches **only** the agent container. Push a new agent
-image from master → CI builds and pushes it to Artifact Registry → within
-`FLEET_AGENT_UPDATE_INTERVAL` seconds (default 300) every node's updater pulls
-it and recreates the agent in place with the same config. No SSH, no `docker
-compose pull` per node. The updater needs the host's GAR login — point
-`FLEET_DOCKER_CONFIG` at wherever you ran `docker login` (default
-`/root/.docker/config.json`).
+**Control-plane driven — from the platform, zero hands-on at the node.** Push a
+new agent image from master → CI builds + pushes it to Artifact Registry → click
+**Update agent** on the node row in the fleet **Nodes** view. The control plane
+sends an `updateAgent` command with a short-lived registry token (the same
+brokered auth it uses for app deploys), the agent pulls the new image, and a
+detached helper runs `docker compose up -d agent` to recreate it from the pulled
+image (`--pull never`, so no node-side registry creds are needed). The node's
+reported `agentVersion` bumps when the new agent boots.
+
+This replaces the old watchtower sidecar, which couldn't use the brokered auth
+and so required a standing GAR login on every node. For self-update to work the
+agent must know this repo's host path — the compose passes it as
+`FLEET_COMPOSE_DIR` (`${PWD}`); set it in `.env` only if you run compose from
+another directory.
 
 Identity (node id + token) lives in the `agent-id` volume and tailscale state in
 `tailscale-state`, so updates never re-enroll the node.

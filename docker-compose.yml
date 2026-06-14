@@ -36,28 +36,23 @@ services:
     restart: unless-stopped
   agent:
     image: ${FLEET_AGENT_IMAGE:-europe-central2-docker.pkg.dev/theitemapp/theitemapp/fleet-agent:latest}
-    pull_policy: always   # always fetch the newest agent on `up` — agents update from master
+    pull_policy: always   # always fetch the newest agent on `up`
     container_name: fleet-agent
     network_mode: "service:tailscale"
     depends_on: [tailscale]
+    environment:
+      # Host path of THIS repo (compose file + .env). The agent hands it to the
+      # detached helper it spawns on an `updateAgent` command so the helper can
+      # `docker compose up -d agent` to recreate the agent from a freshly pulled
+      # image — control-plane-driven self-update, no node-side registry creds
+      # (this replaces the old watchtower sidecar, which couldn't use the agent's
+      # brokered auth). `${PWD}` resolves to the dir you run `docker compose` in;
+      # set FLEET_COMPOSE_DIR explicitly in .env if you run compose elsewhere.
+      FLEET_COMPOSE_DIR: ${FLEET_COMPOSE_DIR:-${PWD}}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent-id:/data
     command: ["--core-url", "${FLEET_CORE_URL:?set FLEET_CORE_URL in .env}", "--join-key", "${FLEET_JOIN_KEY:?set FLEET_JOIN_KEY in .env}", "--name", "${FLEET_NODE_NAME}"]
-    restart: unless-stopped
-  # Self-update: when a newer fleet-agent image is pushed (from master), this
-  # pulls it and recreates the agent with the same config — agents update
-  # themselves with zero hands-on at the node. Watches ONLY the agent container.
-  updater:
-    image: containrrr/watchtower:latest
-    container_name: fleet-updater
-    command: ["fleet-agent"]
-    environment:
-      WATCHTOWER_POLL_INTERVAL: "${FLEET_AGENT_UPDATE_INTERVAL:-300}"
-      WATCHTOWER_CLEANUP: "true"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${FLEET_DOCKER_CONFIG:-/root/.docker/config.json}:/config.json:ro
     restart: unless-stopped
   router:
     image: alpine:3.20

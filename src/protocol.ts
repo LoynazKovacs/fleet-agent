@@ -47,7 +47,8 @@ export type CommandKind =
   | 'remove'
   | 'pull'
   | 'deployApp'
-  | 'removeApp';
+  | 'removeApp'
+  | 'updateAgent';
 
 /**
  * Ephemeral registry credentials for an authenticated image pull, shaped as a
@@ -123,8 +124,8 @@ export interface Command {
   spec?: RunContainerSpec; // for `run`
   bundle?: BundleSpec; // for `deployApp` — per-service auth attached at dispatch, never persisted
   removeBundle?: BundleRemoveSpec; // for `removeApp`
-  target?: string; // container name/id (stop/start/restart/remove) or image ref (pull)
-  auth?: RegistryAuth; // ephemeral pull credentials (run/pull); attached at dispatch, never persisted
+  target?: string; // container name/id (stop/start/restart/remove) or image ref (pull/updateAgent)
+  auth?: RegistryAuth; // ephemeral pull credentials (run/pull/updateAgent); attached at dispatch, never persisted
   createdAt: string;
 }
 
