@@ -99,6 +99,13 @@ export interface BundleSpec {
   appKey: string;
   networkName: string;
   services: BundleServiceSpec[];
+  /**
+   * True when this bundle materializes a core. Only a core publishes host ports
+   * (its web is the node's `:80` front door); app bundles are fleet-net-internal
+   * and reached through their bound core's Caddy, so the agent does NOT publish
+   * their ports to the host (avoids apps squatting the host's `:80`).
+   */
+  isCore?: boolean;
 }
 
 /** The services + shared network to tear down as a unit (`removeApp`). */

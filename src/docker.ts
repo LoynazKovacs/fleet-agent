@@ -193,7 +193,7 @@ export class DockerClient {
   async runContainer(
     spec: RunContainerSpec,
     auth?: RegistryAuth,
-    opts?: { networkAlias?: string; staticIp?: string; dns?: string[] },
+    opts?: { networkAlias?: string; staticIp?: string; dns?: string[]; publishHost?: boolean },
   ): Promise<string> {
     if (spec.pull !== false) {
       await this.pullImage(spec.image, auth);
@@ -212,12 +212,18 @@ export class DockerClient {
       }
     }
 
+    // Host-publish gate: default true (the standalone `run` path keeps publishing),
+    // but the bundle path passes publishHost=false for non-core apps so they never
+    // bind a host port — they are reached on the fleet-net via their static IP and
+    // their bound core's Caddy. Container ports are still tracked (ExposedPorts) so
+    // the bundle's publicUrl/fleet-IP resolution is unaffected.
+    const publishHost = opts?.publishHost ?? true;
     const portBindings: Record<string, Array<{ HostPort: string }>> = {};
     const exposedPorts: Record<string, Record<string, never>> = {};
     for (const p of spec.ports ?? []) {
       const key = `${p.container}/${p.protocol ?? 'tcp'}`;
       exposedPorts[key] = {};
-      portBindings[key] = [{ HostPort: String(p.host) }];
+      if (publishHost) portBindings[key] = [{ HostPort: String(p.host) }];
     }
 
     const binds = (spec.volumes ?? []).map((v) => `${v.host}:${v.container}${v.readOnly ? ':ro' : ''}`);
@@ -312,7 +318,9 @@ export class DockerClient {
           svc.auth,
           // MagicDNS so the deployed app can resolve core's tailnet serve name;
           // static IP (when assigned) pins the address baked into publicUrl.
-          { networkAlias: svc.serviceName, staticIp, dns: ['100.100.100.100'] },
+          // Only a core publishes host ports (its web = the node's :80 front door);
+          // app bundles stay fleet-net-internal so they never squat the host's :80.
+          { networkAlias: svc.serviceName, staticIp, dns: ['100.100.100.100'], publishHost: spec.isCore === true },
         );
         results.push({ serviceName: svc.serviceName, containerName, ok: true, containerId: id });
       } catch (err) {
