@@ -485,6 +485,12 @@ export class DockerClient {
   /** Create the per-app bridge network if it does not already exist. */
   private async ensureNetwork(name: string): Promise<void> {
     if (!name) return;
+    // fleet-net is owned by ensureFleetNetwork — it MUST carry the node's assigned
+    // /24 so control-plane-allocated IPs fit. Never create it here as a plain
+    // (default-subnet) bridge: a stray plain fleet-net created before Stage-3 ran
+    // is exactly what made `network connect <fleet-ip>` fail with "no configured
+    // subnet contains …". Leave it to ensureFleetNetwork (which reconciles it).
+    if (name === FLEET_NET_NAME) return;
     const nets = await this.docker.listNetworks();
     if (nets.some((n) => n.Name === name)) return;
     await this.docker.createNetwork({ Name: name, Driver: 'bridge' });
@@ -493,17 +499,50 @@ export class DockerClient {
   // ── Stage 3: fleet network + Tailscale subnet-router (gated by FLEET_NET_ENABLED) ──
 
   /**
-   * Ensure the node's fleet network exists on its control-plane-assigned subnet.
+   * Ensure the node's fleet network exists ON its control-plane-assigned subnet.
    * Unlike the per-app network this is a single, stable, node-wide bridge whose
-   * subnet is unique across the fleet so the Tailscale subnet-router can
-   * advertise it without colliding with another node's routes. Idempotent; if a
-   * network of the same name already exists we leave it (a subnet change would
-   * need a manual recreate since Docker can't resize a live network).
+   * subnet is unique across the fleet so the Tailscale subnet-router can advertise
+   * it without colliding with another node's routes.
+   *
+   * RECONCILES the subnet: if a `fleet-net` already exists but on the WRONG subnet
+   * (e.g. a plain default bridge created before Stage-3, or a stale subnet after a
+   * reassignment), it is recreated on the correct subnet — otherwise control-plane
+   * fleet IPs don't fit and `network connect` fails ("no configured subnet contains
+   * …"). Recreating means disconnecting current members (force); app bundles are
+   * reattached on their next (re)install and the subnet-router by ensureSubnetRouter
+   * which runs right after this. Docker can't resize a live network, so recreate is
+   * the only way to correct it.
    */
   async ensureFleetNetwork(name: string, subnet: string): Promise<void> {
     if (!name || !subnet) return;
     const nets = await this.docker.listNetworks();
-    if (nets.some((n) => n.Name === name)) return;
+    const existing = nets.find((n) => n.Name === name);
+    if (existing) {
+      let current: string | undefined;
+      let memberIds: string[] = [];
+      try {
+        const inspected = (await this.docker.getNetwork(existing.Id).inspect()) as any;
+        current = inspected?.IPAM?.Config?.[0]?.Subnet;
+        memberIds = inspected?.Containers ? Object.keys(inspected.Containers) : [];
+      } catch {
+        return; // can't inspect — leave it alone
+      }
+      if (current === subnet) return; // already correct
+      // Wrong subnet — recreate. Disconnect every member first (Docker refuses to
+      // remove a network with attachments), then remove + recreate on the subnet.
+      for (const cid of memberIds) {
+        try {
+          await this.docker.getNetwork(existing.Id).disconnect({ Container: cid, Force: true });
+        } catch {
+          /* member already gone / not disconnectable — best effort */
+        }
+      }
+      try {
+        await this.docker.getNetwork(existing.Id).remove();
+      } catch {
+        return; // still in use / undeletable — bail rather than half-fix
+      }
+    }
     await this.docker.createNetwork({
       Name: name,
       Driver: 'bridge',
