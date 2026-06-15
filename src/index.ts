@@ -142,12 +142,28 @@ async function main(): Promise<void> {
         pollIntervalMs = res.pollIntervalMs;
       }
 
-      // Stage 3: once the control plane has assigned this node a subnet, bring up
-      // its fleet network + Tailscale subnet-router (once). Strictly gated by
-      // FLEET_NET_ENABLED, so a normal deploy never touches Tailscale.
-      if (config.netEnabled && config.tsAuthKey && res.network?.subnet && !fleetNetReady) {
+      // Stage 3: once the control plane has assigned this node a subnet, ensure
+      // its fleet network and its Tailscale subnet-router. These are DECOUPLED:
+      //
+      //  • The fleet-net docker bridge only needs the assigned subnet — NOT the
+      //    tailscale auth key. We ensure/reconcile it on EVERY poll (idempotent:
+      //    a no-op when already correct, a recreate when the subnet is wrong, e.g.
+      //    a stale/colliding /24 left over from a reassignment). Coupling it to the
+      //    auth key was a bug: a single-use key gets consumed, after which the agent
+      //    could never (re)create or fix the network.
+      //  • The subnet-router DOES need the auth key; bring it up once when present.
+      //
+      // All strictly gated by FLEET_NET_ENABLED, so a normal deploy never touches
+      // the fleet network or Tailscale.
+      if (config.netEnabled && res.network?.subnet) {
         try {
           await docker.ensureFleetNetwork(res.network.name, res.network.subnet);
+        } catch (err) {
+          console.warn(`[fleet-agent] ensureFleetNetwork failed (will retry next poll): ${(err as Error).message}`);
+        }
+      }
+      if (config.netEnabled && config.tsAuthKey && res.network?.subnet && !fleetNetReady) {
+        try {
           await docker.ensureSubnetRouter({
             containerName: 'fleet-tailscale',
             networkName: res.network.name,
@@ -157,9 +173,9 @@ async function main(): Promise<void> {
             stateVolume: 'fleet-tailscale-state',
           });
           fleetNetReady = true;
-          console.log(`[fleet-agent] fleet-net ${res.network.name} (${res.network.subnet}) + Tailscale subnet-router up`);
+          console.log(`[fleet-agent] Tailscale subnet-router up for ${res.network.name} (${res.network.subnet})`);
         } catch (err) {
-          console.warn(`[fleet-agent] fleet network bring-up failed (will retry next poll): ${(err as Error).message}`);
+          console.warn(`[fleet-agent] subnet-router bring-up failed (will retry next poll): ${(err as Error).message}`);
         }
       }
 
