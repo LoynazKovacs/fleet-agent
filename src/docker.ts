@@ -16,6 +16,9 @@ export interface HostInfo {
   dockerVersion: string;
 }
 
+/** The shared, node-wide mesh network — never torn down with a single bundle. */
+const FLEET_NET_NAME = 'fleet-net';
+
 export class DockerClient {
   private readonly docker: Docker;
 
@@ -193,7 +196,20 @@ export class DockerClient {
   async runContainer(
     spec: RunContainerSpec,
     auth?: RegistryAuth,
-    opts?: { networkAlias?: string; staticIp?: string; dns?: string[]; publishHost?: boolean },
+    opts?: {
+      networkAlias?: string;
+      staticIp?: string;
+      dns?: string[];
+      publishHost?: boolean;
+      /**
+       * Control-plane-resolved network memberships (Stack-isolation epic). When
+       * set, the container is CREATED on `networks[0]` (with its alias/ipv4) and
+       * each remaining network is `connect`ed after start — so a service can be
+       * dual-homed (its private `<stack>-net` + `fleet-net`). Supersedes the
+       * legacy `networkAlias`/`staticIp` (single-network) path.
+       */
+      networks?: Array<{ name: string; ipv4?: string; alias?: string }>;
+    },
   ): Promise<string> {
     if (spec.pull !== false) {
       await this.pullImage(spec.image, auth);
@@ -228,11 +244,24 @@ export class DockerClient {
 
     const binds = (spec.volumes ?? []).map((v) => `${v.host}:${v.container}${v.readOnly ? ':ro' : ''}`);
 
-    const endpoint: { Aliases?: string[]; IPAMConfig?: { IPv4Address: string } } = {};
-    if (opts?.networkAlias) endpoint.Aliases = [opts.networkAlias];
-    if (opts?.staticIp) endpoint.IPAMConfig = { IPv4Address: opts.staticIp };
+    // Build the endpoint config for the container's PRIMARY network. Declarative
+    // `opts.networks` (control-plane-resolved) wins: the primary is networks[0],
+    // additional memberships are connected after start. Otherwise fall back to
+    // the legacy single-network `spec.network` + `networkAlias`/`staticIp`.
+    const makeEndpoint = (alias?: string, ipv4?: string): { Aliases?: string[]; IPAMConfig?: { IPv4Address: string } } => {
+      const ep: { Aliases?: string[]; IPAMConfig?: { IPv4Address: string } } = {};
+      if (alias) ep.Aliases = [alias];
+      if (ipv4) ep.IPAMConfig = { IPv4Address: ipv4 };
+      return ep;
+    };
+
+    const declarative = opts?.networks && opts.networks.length ? opts.networks : null;
+    const primaryNetName = declarative ? declarative[0].name : spec.network;
+    const primaryEndpoint = declarative
+      ? makeEndpoint(declarative[0].alias, declarative[0].ipv4)
+      : makeEndpoint(opts?.networkAlias, opts?.staticIp);
     const endpointsConfig =
-      spec.network && Object.keys(endpoint).length ? { [spec.network]: endpoint } : undefined;
+      primaryNetName && Object.keys(primaryEndpoint).length ? { [primaryNetName]: primaryEndpoint } : undefined;
 
     const container = await this.docker.createContainer({
       Image: spec.image,
@@ -243,13 +272,24 @@ export class DockerClient {
       HostConfig: {
         PortBindings: Object.keys(portBindings).length ? portBindings : undefined,
         Binds: binds.length ? binds : undefined,
-        NetworkMode: spec.network,
+        NetworkMode: primaryNetName,
         Dns: opts?.dns && opts.dns.length ? opts.dns : undefined,
         RestartPolicy: spec.restart && spec.restart !== 'no' ? { Name: spec.restart } : undefined,
       },
       NetworkingConfig: endpointsConfig ? { EndpointsConfig: endpointsConfig } : undefined,
     });
     await container.start();
+
+    // Dual-home: connect every additional declarative network after start (a
+    // container can be created on only one network; the rest are joined here).
+    if (declarative && declarative.length > 1) {
+      for (const n of declarative.slice(1)) {
+        const ep = makeEndpoint(n.alias, n.ipv4);
+        await this.docker
+          .getNetwork(n.name)
+          .connect({ Container: container.id, EndpointConfig: Object.keys(ep).length ? ep : undefined });
+      }
+    }
     return container.id.slice(0, 12);
   }
 
@@ -265,6 +305,54 @@ export class DockerClient {
    * already-started services are LEFT RUNNING (no rollback).
    */
   async deployBundle(spec: BundleSpec): Promise<BundleServiceResult[]> {
+    // New-shape (Stack-isolation epic): the control plane resolved each service's
+    // network memberships + IPs + publishHost — apply them declaratively. An old
+    // control plane omits `networks[]` ⇒ fall back to the legacy self-IP path, so
+    // a NEW agent still serves an un-upgraded control plane during rollout.
+    const declarative = spec.services.some((s) => Array.isArray(s.networks) && s.networks.length > 0);
+    if (declarative) return this.deployBundleDeclarative(spec);
+    return this.deployBundleLegacy(spec);
+  }
+
+  /**
+   * Apply a control-plane-resolved bundle: ensure every referenced network, then
+   * start each service (dependsOn order) attached to its declared `networks[]`
+   * (private `<stack>-net` + optional `fleet-net` with an allocated IP), binding
+   * host ports only for services flagged `publishHost`. The agent computes NO IPs
+   * here — `${service.publicUrl}` and `FLEET_SERVICE_ENDPOINTS` were resolved by
+   * the control plane.
+   */
+  private async deployBundleDeclarative(spec: BundleSpec): Promise<BundleServiceResult[]> {
+    const networks = new Set<string>();
+    for (const svc of spec.services) for (const n of svc.networks ?? []) networks.add(n.name);
+    for (const n of networks) await this.ensureNetwork(n);
+
+    const ordered = orderServicesByDependsOn(spec.services);
+    const results: BundleServiceResult[] = [];
+    for (const svc of ordered) {
+      const containerName = svc.name ?? `${spec.appKey}-${svc.serviceName}`;
+      try {
+        const id = await this.runContainer(
+          { ...svc, name: containerName, network: svc.networks?.[0]?.name },
+          svc.auth,
+          {
+            networks: svc.networks,
+            publishHost: svc.publishHost ?? spec.isCore === true,
+            // A core leads with a public resolver (Atlas SRV); an app leads with
+            // MagicDNS to reach its core's serve name, falling back to public.
+            dns: spec.isCore === true ? ['8.8.8.8', '100.100.100.100'] : ['100.100.100.100', '8.8.8.8'],
+          },
+        );
+        results.push({ serviceName: svc.serviceName, containerName, ok: true, containerId: id });
+      } catch (err) {
+        results.push({ serviceName: svc.serviceName, containerName, ok: false, error: (err as Error).message });
+      }
+    }
+    return results;
+  }
+
+  /** Legacy bundle deploy: single `networkName` + agent-assigned static IPs (pre-Stack-isolation control planes). */
+  private async deployBundleLegacy(spec: BundleSpec): Promise<BundleServiceResult[]> {
     await this.ensureNetwork(spec.networkName);
     // The fleet net's IPAM base (e.g. "10.42.0" from 10.42.0.0/24) — needed to
     // assign deterministic static IPs to the bundle's services. Null if the
@@ -381,7 +469,10 @@ export class DockerClient {
         results.push({ serviceName: '', containerName: name, ok: false, error: (err as Error).message });
       }
     }
-    if (spec.networkName) {
+    // Remove the bundle's OWN (stack-private) network, but NEVER the shared
+    // fleet-net — other stacks/cores live on it. (Docker would also refuse while
+    // in use, but we guard explicitly so intent is clear.)
+    if (spec.networkName && spec.networkName !== FLEET_NET_NAME) {
       try {
         await this.docker.getNetwork(spec.networkName).remove();
       } catch {

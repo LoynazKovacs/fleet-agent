@@ -87,6 +87,24 @@ export interface BundleServiceSpec extends RunContainerSpec {
   serviceName: string;
   dependsOn?: string[];
   auth?: RegistryAuth;
+  /**
+   * Explicit, control-plane-resolved network memberships (Stack-isolation epic).
+   * When present the agent attaches the container to `networks[0]` (its primary,
+   * with that entry's `ipv4`/`alias`) and `network connect`s the rest — instead
+   * of computing IPs itself. Every stack service is on its private `<stack>-net`;
+   * EXPOSED services additionally carry a `fleet-net` entry with a control-plane-
+   * allocated `ipv4`. Absent ⇒ agent falls back to the legacy single-`network` +
+   * self-assigned-IP behavior (rollout back-compat).
+   */
+  networks?: Array<{ name: string; ipv4?: string; alias?: string }>;
+  /**
+   * Whether THIS service publishes its ingress ports to the host. Replaces the
+   * bundle-level `isCore` gate so only a core's `web` (the node's `:80` front
+   * door) binds host ports, while the core's backend/mongo and all app services
+   * stay off the host. Absent ⇒ agent falls back to the bundle-level `isCore`
+   * rule.
+   */
+  publishHost?: boolean;
 }
 
 /**
