@@ -26,11 +26,19 @@ export interface AgentConfig {
    * auto-start Tailscale. Turn on per node only when bringing up the tailnet.
    */
   netEnabled: boolean;
-  /** This node's Tailscale auth key (bootstrap secret, single-use). Required to
-   * bring up the subnet-router when netEnabled. */
+  /** This node's Tailscale auth key (bootstrap secret, single-use). Set ONLY for
+   * the LEGACY standalone subnet-router path; the canonical node leaves it unset
+   * and advertises in place from its shared-netns uplink. */
   tsAuthKey: string;
   /** Tailscale node hostname; defaults to the agent `name`. */
   tsHostname: string;
+  /**
+   * Name of the shared-netns Tailscale UPLINK container the agent advertises the
+   * fleet subnet from (in place, via `tailscale set`). The agent shares this
+   * container's network namespace, so its control-plane polling rides the
+   * uplink's default route — independent of fleet-net. Default `fleet-tailscale`.
+   */
+  uplinkContainerName: string;
 }
 
 /** Read `--key value` flags first, then FLEET_* env, then defaults. */
@@ -66,5 +74,6 @@ export function getAgentConfig(): AgentConfig {
     netEnabled: flagBool('net-enabled', process.env.FLEET_NET_ENABLED),
     tsAuthKey: flag('ts-authkey', process.env.FLEET_TS_AUTHKEY),
     tsHostname: flag('ts-hostname', process.env.FLEET_TS_HOSTNAME, name),
+    uplinkContainerName: flag('uplink-container', process.env.FLEET_UPLINK_CONTAINER, 'fleet-tailscale'),
   };
 }

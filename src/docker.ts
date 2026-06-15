@@ -551,6 +551,83 @@ export class DockerClient {
   }
 
   /**
+   * Attach the node's existing Tailscale uplink container to `fleet-net` as a
+   * SECONDARY interface, so it can route inbound tailnet traffic into the app
+   * subnet WITHOUT owning the uplink's default route.
+   *
+   * This is the heart of the agent/fleet-net DECOUPLING (Stack-isolation epic):
+   * the uplink (`fleet-tailscale`, whose netns the agent shares) gets its default
+   * route + internet underlay from a dedicated `fleet-uplink` bridge, so the
+   * agent's reach to the tailnet-only control plane is INDEPENDENT of fleet-net.
+   * fleet-net is merely an extra leg used to forward to app containers. Docker
+   * keeps the default gateway on the container's PRIMARY network, so connecting
+   * fleet-net here never moves the default route — reconciling/recreating
+   * fleet-net only drops this secondary leg (re-added on the next poll), never the
+   * uplink that carries the agent's polling.
+   *
+   * Idempotent: a no-op when the container is already attached. Best-effort — a
+   * missing uplink (e.g. a non-net node) just means no inbound routing yet.
+   */
+  async ensureUplinkOnFleetNetwork(uplinkContainerName: string, networkName: string): Promise<boolean> {
+    if (!uplinkContainerName || !networkName) return false;
+    const info = await this.findByName(uplinkContainerName);
+    if (!info) return false; // uplink not up (yet) — try again next poll
+    let attached = false;
+    try {
+      const inspected = (await this.docker.getContainer(info.Id).inspect()) as any;
+      const nets = inspected?.NetworkSettings?.Networks ?? {};
+      attached = Object.prototype.hasOwnProperty.call(nets, networkName);
+    } catch {
+      return false;
+    }
+    if (attached) return true;
+    try {
+      await this.docker.getNetwork(networkName).connect({ Container: info.Id });
+      return true;
+    } catch {
+      return false; // network missing / transient — retried next poll
+    }
+  }
+
+  /**
+   * ADVERTISE the fleet subnet from the uplink, IN PLACE, via `tailscale set
+   * --advertise-routes` exec'd inside the uplink container — no recreate, so the
+   * agent (which shares the uplink's netns) is never knocked offline. This is the
+   * advertise-route SELF-HEAL: whenever the control plane reconciles the node to a
+   * new fleet-net subnet, the agent re-runs this and the advertised route tracks
+   * the subnet, with no re-auth (the uplink keeps its existing tailnet identity).
+   *
+   * `tailscale set` is idempotent on the tailscaled side, but the caller still
+   * tracks the last-applied subnet to avoid an exec every poll. `--accept-routes`
+   * is re-asserted so the node keeps reaching the subnets other nodes advertise.
+   * Returns true on a clean apply. Best-effort: a not-yet-ready tailscaled simply
+   * fails this poll and is retried.
+   */
+  async setAdvertisedRoutes(uplinkContainerName: string, subnet: string): Promise<boolean> {
+    if (!uplinkContainerName || !subnet) return false;
+    const info = await this.findByName(uplinkContainerName);
+    if (!info) return false;
+    try {
+      const exec = await this.docker.getContainer(info.Id).exec({
+        Cmd: ['tailscale', 'set', `--advertise-routes=${subnet}`, '--accept-routes'],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      const stream = await exec.start({ Detach: false });
+      // Drain the exec output so the stream closes, then read the exit code.
+      await new Promise<void>((resolve) => {
+        stream.on('data', () => {});
+        stream.on('end', resolve);
+        stream.on('error', () => resolve());
+      });
+      const inspect = (await exec.inspect()) as any;
+      return inspect?.ExitCode === 0 || inspect?.ExitCode == null;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Ensure the node's Tailscale subnet-router container is running. It joins the
    * tailnet with the node's (single-use) auth key, ADVERTISES the fleet subnet so
    * the whole fleet network is reachable from other tailnet nodes, and ACCEPTS
@@ -558,12 +635,11 @@ export class DockerClient {
    * routing needs NET_ADMIN + /dev/net/tun + ip_forward. Idempotent: replaces an
    * existing router of the same name (e.g. on subnet change / restart).
    *
-   * NOTE (to validate in the supervised bring-up): inbound (other node → this
-   * fleet-net) works with the router attached to fleet-net + advertise-routes.
-   * Outbound (a fleet-net container → another node's subnet) additionally needs
-   * fleet-net containers to route the tailnet pool via this router — to be
-   * confirmed live; may require an explicit route or making the router the
-   * gateway for 10.42.0.0/16.
+   * LEGACY / fallback path: used only when there is no shared-netns uplink to
+   * advertise from (e.g. a standalone subnet-router node). The DEFAULT canonical
+   * node now advertises in place from its uplink via `setAdvertisedRoutes` +
+   * `ensureUplinkOnFleetNetwork`, which keeps the agent's control-plane polling
+   * decoupled from fleet-net churn. Kept for back-compat with older bring-ups.
    */
   async ensureSubnetRouter(opts: {
     containerName: string;

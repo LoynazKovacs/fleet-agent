@@ -109,12 +109,18 @@ async function main(): Promise<void> {
 
   let pollIntervalMs = config.pollIntervalMs;
   let pendingResults: CommandResult[] = [];
-  let fleetNetReady = false; // brought the fleet network + subnet-router up once
+  let fleetNetReady = false; // LEGACY path: brought the standalone subnet-router up once
+  let advertisedSubnet = ''; // CANONICAL path: the subnet currently advertised from the uplink
 
-  if (config.netEnabled && !config.tsAuthKey) {
-    console.warn('[fleet-agent] FLEET_NET_ENABLED is set but no FLEET_TS_AUTHKEY — cannot bring up the Tailscale subnet-router');
+  if (config.netEnabled) {
+    if (config.tsAuthKey) {
+      console.log('[fleet-agent] Stage-3 networking ENABLED (LEGACY standalone subnet-router; FLEET_TS_AUTHKEY set)');
+    } else {
+      console.log(
+        `[fleet-agent] Stage-3 networking ENABLED — will create fleet-net and advertise it IN PLACE from uplink "${config.uplinkContainerName}" (decoupled from the agent's control-plane polling)`,
+      );
+    }
   }
-  if (config.netEnabled) console.log('[fleet-agent] Stage-3 networking ENABLED — will bring up fleet-net + Tailscale subnet-router once a subnet is assigned');
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -162,15 +168,44 @@ async function main(): Promise<void> {
           console.warn(`[fleet-agent] ensureFleetNetwork failed (will retry next poll): ${(err as Error).message}`);
         }
       }
+      if (config.netEnabled && res.network?.subnet && !config.tsAuthKey) {
+        // CANONICAL: advertise the fleet subnet IN PLACE from the shared-netns
+        // uplink. (a) attach the uplink to fleet-net as a SECONDARY leg so it can
+        // forward inbound tailnet traffic to app containers — done every poll so a
+        // reconcile that recreated fleet-net re-attaches it; (b) self-heal the
+        // advertised route whenever the assigned subnet changes, via `tailscale
+        // set` (no recreate → the agent's own polling, which shares this uplink's
+        // netns + default route, is never severed).
+        try {
+          await docker.ensureUplinkOnFleetNetwork(config.uplinkContainerName, res.network.name);
+        } catch (err) {
+          console.warn(`[fleet-agent] uplink fleet-net attach failed (will retry next poll): ${(err as Error).message}`);
+        }
+        if (res.network.subnet !== advertisedSubnet) {
+          try {
+            const ok = await docker.setAdvertisedRoutes(config.uplinkContainerName, res.network.subnet);
+            if (ok) {
+              advertisedSubnet = res.network.subnet;
+              console.log(`[fleet-agent] advertising fleet subnet ${res.network.subnet} from uplink "${config.uplinkContainerName}"`);
+            } else {
+              console.warn('[fleet-agent] advertise-route apply failed (will retry next poll)');
+            }
+          } catch (err) {
+            console.warn(`[fleet-agent] advertise-route apply failed (will retry next poll): ${(err as Error).message}`);
+          }
+        }
+      }
       if (config.netEnabled && config.tsAuthKey && res.network?.subnet && !fleetNetReady) {
+        // LEGACY: bring up a standalone subnet-router container once (back-compat
+        // for older bring-ups that pass FLEET_TS_AUTHKEY to the agent).
         try {
           await docker.ensureSubnetRouter({
-            containerName: 'fleet-tailscale',
+            containerName: 'fleet-subnet-router',
             networkName: res.network.name,
             hostname: config.tsHostname,
             authKey: config.tsAuthKey,
             subnet: res.network.subnet,
-            stateVolume: 'fleet-tailscale-state',
+            stateVolume: 'fleet-subnet-router-state',
           });
           fleetNetReady = true;
           console.log(`[fleet-agent] Tailscale subnet-router up for ${res.network.name} (${res.network.subnet})`);
