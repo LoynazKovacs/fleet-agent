@@ -316,11 +316,23 @@ export class DockerClient {
         const id = await this.runContainer(
           { ...svc, name: containerName, network: spec.networkName, env },
           svc.auth,
-          // MagicDNS so the deployed app can resolve core's tailnet serve name;
+          // DNS upstreams for the container's embedded resolver (sibling names
+          // always resolve via Docker's 127.0.0.11; these are the EXTERNAL
+          // upstreams it forwards to). A core talks to an external DB (e.g. Atlas
+          // `mongodb+srv://`, which needs a public SRV lookup) and never needs to
+          // resolve a tailnet `.ts.net` name, so it leads with a public resolver;
+          // MagicDNS (100.100.100.100) can't answer public SRV and would crash the
+          // core (ESERVFAIL). An app may need MagicDNS to reach its core's tailnet
+          // serve name, so it leads with that and falls back to public.
           // static IP (when assigned) pins the address baked into publicUrl.
           // Only a core publishes host ports (its web = the node's :80 front door);
           // app bundles stay fleet-net-internal so they never squat the host's :80.
-          { networkAlias: svc.serviceName, staticIp, dns: ['100.100.100.100'], publishHost: spec.isCore === true },
+          {
+            networkAlias: svc.serviceName,
+            staticIp,
+            dns: spec.isCore === true ? ['8.8.8.8', '100.100.100.100'] : ['100.100.100.100', '8.8.8.8'],
+            publishHost: spec.isCore === true,
+          },
         );
         results.push({ serviceName: svc.serviceName, containerName, ok: true, containerId: id });
       } catch (err) {
