@@ -159,7 +159,16 @@ export class DockerClient {
     // guarantees the swap even if compose thinks nothing changed. The leading
     // sleep lets the current poll deliver this command's result before compose
     // stops us.
-    const script = `sleep 6; cd "${composeDir}" && docker compose up -d --pull never --force-recreate agent`;
+    // `--no-deps` is essential: the agent service shares the tailscale netns and
+    // does NOT attach fleet-net, but a plain `docker compose up agent` re-evaluates
+    // the project's networks and FAILS if fleet-net exists without compose's labels
+    // (the agent owns/reconciles fleet-net out of band, so it never carries them).
+    // That silent failure is why earlier self-updates "succeeded" yet never swapped
+    // the container. --no-deps scopes the recreate to just the agent, untouched by
+    // the network. The compose service name is overridable via FLEET_COMPOSE_SERVICE
+    // for composes that name it differently (default `agent`).
+    const service = (process.env.FLEET_COMPOSE_SERVICE ?? 'agent').trim() || 'agent';
+    const script = `sleep 6; cd "${composeDir}" && docker compose up -d --pull never --force-recreate --no-deps ${service}`;
     const helperName = `fleet-agent-updater-${Date.now().toString(36)}`;
     const helper = await this.docker.createContainer({
       Image: 'docker:cli',
