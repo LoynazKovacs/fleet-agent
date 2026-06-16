@@ -110,7 +110,7 @@ async function main(): Promise<void> {
   let pollIntervalMs = config.pollIntervalMs;
   let pendingResults: CommandResult[] = [];
   let fleetNetReady = false; // LEGACY path: brought the standalone subnet-router up once
-  let advertisedSubnet = ''; // CANONICAL path: the subnet currently advertised from the uplink
+  let advertisedRoutesKey = ''; // CANONICAL path: the route set currently advertised from the uplink
 
   if (config.netEnabled) {
     if (config.tsAuthKey) {
@@ -181,12 +181,20 @@ async function main(): Promise<void> {
         } catch (err) {
           console.warn(`[fleet-agent] uplink fleet-net attach failed (will retry next poll): ${(err as Error).message}`);
         }
-        if (res.network.subnet !== advertisedSubnet) {
+        // Advertise the UNION of: the assigned fleet /24, any control-plane-supplied
+        // extra routes, and node-local FLEET_EXTRA_ROUTES (a co-located master's
+        // legacy docker net). `--advertise-routes` replaces, so we always send the
+        // full set; never just the /24 (that would drop the legacy routes).
+        const routes = [
+          ...new Set([res.network.subnet, ...(res.network.extraRoutes ?? []), ...config.extraRoutes].filter(Boolean)),
+        ];
+        const routesKey = [...routes].sort().join(',');
+        if (routesKey !== advertisedRoutesKey) {
           try {
-            const ok = await docker.setAdvertisedRoutes(config.uplinkContainerName, res.network.subnet);
+            const ok = await docker.setAdvertisedRoutes(config.uplinkContainerName, routes);
             if (ok) {
-              advertisedSubnet = res.network.subnet;
-              console.log(`[fleet-agent] advertising fleet subnet ${res.network.subnet} from uplink "${config.uplinkContainerName}"`);
+              advertisedRoutesKey = routesKey;
+              console.log(`[fleet-agent] advertising routes [${routes.join(', ')}] from uplink "${config.uplinkContainerName}"`);
             } else {
               console.warn('[fleet-agent] advertise-route apply failed (will retry next poll)');
             }

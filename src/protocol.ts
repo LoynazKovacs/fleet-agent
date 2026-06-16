@@ -188,5 +188,11 @@ export interface PollResponse {
   // tailnet via its Tailscale subnet-router — so the node never collides with
   // another node's routes. Acted on only when FLEET_NET_ENABLED is set; absent
   // until the control plane has allocated a subnet.
-  network?: { name: string; subnet: string };
+  //
+  // `extraRoutes` are additional subnets this node must advertise alongside its
+  // fleet /24 (e.g. a co-located master core's docker net `172.18.0.0/16`). The
+  // agent advertises the UNION of `subnet` + `extraRoutes` + any node-local
+  // FLEET_EXTRA_ROUTES, so a node fronting a legacy net keeps it advertised while
+  // it also joins the fleet-net model. Optional; absent ⇒ just the /24.
+  network?: { name: string; subnet: string; extraRoutes?: string[] };
 }

@@ -39,6 +39,16 @@ export interface AgentConfig {
    * uplink's default route — independent of fleet-net. Default `fleet-tailscale`.
    */
   uplinkContainerName: string;
+  /**
+   * Extra subnet routes this node must advertise IN ADDITION to its fleet /24,
+   * comma-separated. For a co-located master node this is the legacy core docker
+   * net it fronts (e.g. `172.18.0.0/16`) so other nodes keep reaching the master
+   * core while the node also advertises its fleet-net. Advertised as a UNION with
+   * the assigned subnet — `--advertise-routes` replaces, so the agent must always
+   * send the full set. The control plane may also supply extra routes per poll;
+   * the two are merged. Empty by default (a plain node advertises only its /24).
+   */
+  extraRoutes: string[];
 }
 
 /** Read `--key value` flags first, then FLEET_* env, then defaults. */
@@ -75,5 +85,11 @@ export function getAgentConfig(): AgentConfig {
     tsAuthKey: flag('ts-authkey', process.env.FLEET_TS_AUTHKEY),
     tsHostname: flag('ts-hostname', process.env.FLEET_TS_HOSTNAME, name),
     uplinkContainerName: flag('uplink-container', process.env.FLEET_UPLINK_CONTAINER, 'fleet-tailscale'),
+    extraRoutes: parseRoutes(flag('extra-routes', process.env.FLEET_EXTRA_ROUTES, '')),
   };
+}
+
+/** Split a comma/space-separated routes string into a clean, deduped list. */
+function parseRoutes(raw: string): string[] {
+  return [...new Set(raw.split(/[,\s]+/).map((r) => r.trim()).filter(Boolean))];
 }

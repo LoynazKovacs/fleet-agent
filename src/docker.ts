@@ -590,26 +590,33 @@ export class DockerClient {
   }
 
   /**
-   * ADVERTISE the fleet subnet from the uplink, IN PLACE, via `tailscale set
+   * ADVERTISE a set of routes from the uplink, IN PLACE, via `tailscale set
    * --advertise-routes` exec'd inside the uplink container — no recreate, so the
    * agent (which shares the uplink's netns) is never knocked offline. This is the
    * advertise-route SELF-HEAL: whenever the control plane reconciles the node to a
-   * new fleet-net subnet, the agent re-runs this and the advertised route tracks
-   * the subnet, with no re-auth (the uplink keeps its existing tailnet identity).
+   * new fleet-net subnet, the agent re-runs this and the advertised routes track
+   * it, with no re-auth (the uplink keeps its existing tailnet identity).
+   *
+   * `--advertise-routes` REPLACES the advertised set, so the caller must pass the
+   * FULL UNION it wants advertised (the node's fleet /24 PLUS any legacy routes it
+   * still fronts, e.g. a co-located master core's docker net `172.18.0.0/16`).
+   * Passing only the fleet subnet would silently drop those legacy routes and cut
+   * other nodes off from whatever they served — the exact "fix one, break another"
+   * this guards against. An empty list clears advertisements.
    *
    * `tailscale set` is idempotent on the tailscaled side, but the caller still
-   * tracks the last-applied subnet to avoid an exec every poll. `--accept-routes`
-   * is re-asserted so the node keeps reaching the subnets other nodes advertise.
+   * tracks the last-applied set to avoid an exec every poll. `--accept-routes` is
+   * re-asserted so the node keeps reaching the subnets other nodes advertise.
    * Returns true on a clean apply. Best-effort: a not-yet-ready tailscaled simply
    * fails this poll and is retried.
    */
-  async setAdvertisedRoutes(uplinkContainerName: string, subnet: string): Promise<boolean> {
-    if (!uplinkContainerName || !subnet) return false;
+  async setAdvertisedRoutes(uplinkContainerName: string, routes: string[]): Promise<boolean> {
+    if (!uplinkContainerName) return false;
     const info = await this.findByName(uplinkContainerName);
     if (!info) return false;
     try {
       const exec = await this.docker.getContainer(info.Id).exec({
-        Cmd: ['tailscale', 'set', `--advertise-routes=${subnet}`, '--accept-routes'],
+        Cmd: ['tailscale', 'set', `--advertise-routes=${routes.join(',')}`, '--accept-routes'],
         AttachStdout: true,
         AttachStderr: true,
       });
