@@ -228,6 +228,26 @@ export class DockerClient {
       }
     }
 
+    // Netns-sharing path (core egress proxy): run inside the uplink container's
+    // network namespace. No docker networks, no published ports, no static IP —
+    // the container adopts the uplink's interfaces (fleet-net IP + tailnet reach).
+    if (spec.netnsOf) {
+      const target = await this.findByName(spec.netnsOf);
+      if (!target) throw new Error(`netnsOf target "${spec.netnsOf}" not found`);
+      const c = await this.docker.createContainer({
+        Image: spec.image,
+        name: spec.name,
+        Cmd: spec.command,
+        Env: spec.env ? Object.entries(spec.env).map(([k, v]) => `${k}=${v}`) : undefined,
+        HostConfig: {
+          NetworkMode: `container:${target.Id}`,
+          RestartPolicy: spec.restart && spec.restart !== 'no' ? { Name: spec.restart } : undefined,
+        },
+      });
+      await c.start();
+      return c.id.slice(0, 12);
+    }
+
     // Host-publish gate: default true (the standalone `run` path keeps publishing),
     // but the bundle path passes publishHost=false for non-core apps so they never
     // bind a host port — they are reached on the fleet-net via their static IP and
@@ -568,21 +588,36 @@ export class DockerClient {
    * Idempotent: a no-op when the container is already attached. Best-effort — a
    * missing uplink (e.g. a non-net node) just means no inbound routing yet.
    */
-  async ensureUplinkOnFleetNetwork(uplinkContainerName: string, networkName: string): Promise<boolean> {
+  async ensureUplinkOnFleetNetwork(uplinkContainerName: string, networkName: string, ipv4?: string): Promise<boolean> {
     if (!uplinkContainerName || !networkName) return false;
     const info = await this.findByName(uplinkContainerName);
     if (!info) return false; // uplink not up (yet) — try again next poll
     let attached = false;
+    let currentIp: string | undefined;
     try {
       const inspected = (await this.docker.getContainer(info.Id).inspect()) as any;
-      const nets = inspected?.NetworkSettings?.Networks ?? {};
-      attached = Object.prototype.hasOwnProperty.call(nets, networkName);
+      const ep = inspected?.NetworkSettings?.Networks?.[networkName];
+      attached = !!ep;
+      currentIp = ep?.IPAMConfig?.IPv4Address || ep?.IPAddress;
     } catch {
       return false;
     }
-    if (attached) return true;
+    // Already attached at the desired (or any, if none requested) IP → done.
+    if (attached && (!ipv4 || currentIp === ipv4)) return true;
+    // Attached at the WRONG IP → reconnect at the pinned one so the egress proxy
+    // (which shares this netns) sits at a control-plane-known address.
+    if (attached && ipv4 && currentIp !== ipv4) {
+      try {
+        await this.docker.getNetwork(networkName).disconnect({ Container: info.Id, Force: true });
+      } catch {
+        return false;
+      }
+    }
     try {
-      await this.docker.getNetwork(networkName).connect({ Container: info.Id });
+      await this.docker.getNetwork(networkName).connect({
+        Container: info.Id,
+        EndpointConfig: ipv4 ? { IPAMConfig: { IPv4Address: ipv4 } } : undefined,
+      });
       return true;
     } catch {
       return false; // network missing / transient — retried next poll

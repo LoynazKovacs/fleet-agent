@@ -74,6 +74,17 @@ export interface RunContainerSpec {
   command?: string[];
   network?: string;
   pull?: boolean; // pull image before run (default true)
+  /**
+   * Run this container INSIDE another container's network namespace
+   * (`--network container:<name>`). Used for the per-node CORE EGRESS PROXY: a
+   * reverse-proxy that shares the Tailscale uplink's netns so it has real tailnet
+   * reach (MagicDNS + device/serve connectivity) AND is on the uplink's fleet-net
+   * IP — so same-host app containers reach it without any cross-host subnet
+   * routing (the only reliably-working cross-node primitive on every kernel,
+   * incl. WSL2). When set, the agent ignores `network`/`networks`/`ports` (the
+   * netns is shared and owned by the target container).
+   */
+  netnsOf?: string;
 }
 
 /**

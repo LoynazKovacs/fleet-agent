@@ -177,7 +177,12 @@ async function main(): Promise<void> {
         // set` (no recreate → the agent's own polling, which shares this uplink's
         // netns + default route, is never severed).
         try {
-          await docker.ensureUplinkOnFleetNetwork(config.uplinkContainerName, res.network.name);
+          // Pin the uplink to <subnet-base>.2 on fleet-net so the per-node core
+          // egress proxy (which shares the uplink's netns) sits at an address the
+          // control plane can compute without extra reporting.
+          const base = res.network.subnet.split('/')[0].split('.').slice(0, 3).join('.');
+          const uplinkIp = `${base}.2`;
+          await docker.ensureUplinkOnFleetNetwork(config.uplinkContainerName, res.network.name, uplinkIp);
         } catch (err) {
           console.warn(`[fleet-agent] uplink fleet-net attach failed (will retry next poll): ${(err as Error).message}`);
         }
