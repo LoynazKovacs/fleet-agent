@@ -1,15 +1,18 @@
 # Fleet node — clone, fill .env, `docker compose up -d`. That's the whole setup.
 #
-#   tailscale  — joins the tailnet (kernel mode), advertises this node's app
-#                subnet, accepts other nodes' routes, MagicDNS on.
-#   agent      — shares tailscale's netns; polls the control plane, runs deploys.
-#   router     — adds host routes so app containers on THIS host reach the tailnet
-#                (and other nodes' subnets) THROUGH the tailscale.
-#   fleet-net  — the docker network app bundles deploy into; its subnet is what
-#                the tailscale advertises, so core can reach apps here.
+#   tailscale  — the UPLINK: joins the tailnet in kernel mode, accepts other
+#                nodes' routes, MagicDNS on. Stays on the DEFAULT bridge for its
+#                internet underlay; the agent attaches it to fleet-net + advertises.
+#   agent      — shares tailscale's netns; OWNS this node's networking
+#                (FLEET_NET_ENABLED): creates fleet-net on the control-plane /24,
+#                pins the uplink to <base>.2, advertises the subnet in place.
+#   router     — host routes so fleet-net containers can reach other nodes'
+#                subnets THROUGH the uplink (FLEET_TS_IP = the uplink's <base>.2).
 #
-# After `up`, approve this node's advertised subnet route once in the Tailscale
-# admin console (or set an ACL autoApprover for tag:fleet to skip even that).
+# fleet-net is NOT defined here on purpose — the agent owns it (creates/reconciles
+# it on the assigned subnet). Defining it in compose caused a hard label conflict
+# with the agent-created network. The agent advertises the route; approve it once
+# in the Tailscale admin (or an autoApprover ACL for tag:fleet over 10.42.0.0/16).
 name: fleet
 services:
   tailscale:
@@ -20,19 +23,21 @@ services:
     devices: ["/dev/net/tun:/dev/net/tun"]
     sysctls:
       net.ipv4.ip_forward: "1"
+      # Required for subnet-router return traffic to survive reverse-path
+      # filtering (tailscale sets this itself only if /proc/sys is writable —
+      # which it isn't at runtime; setting it here at create time makes it stick).
+      net.ipv4.conf.all.src_valid_mark: "1"
     environment:
       TS_USERSPACE: "false"
       TS_AUTHKEY: ${FLEET_TS_AUTHKEY:?paste this node's Tailscale auth key in .env}
       TS_HOSTNAME: ${FLEET_NODE_NAME}
       TS_STATE_DIR: /var/lib/tailscale
       TS_ACCEPT_DNS: "true"
-      TS_ROUTES: ${FLEET_SUBNET:-10.42.0.0/24}
+      # No TS_ROUTES: the agent advertises the assigned fleet /24 (+ any extra
+      # routes) IN PLACE via `tailscale set`, so it self-heals on subnet changes.
       TS_EXTRA_ARGS: --accept-routes
     volumes:
       - tailscale-state:/var/lib/tailscale
-    networks:
-      fleet-net:
-        ipv4_address: ${FLEET_TS_IP:-10.42.0.2}
     restart: unless-stopped
   agent:
     image: ${FLEET_AGENT_IMAGE:-europe-central2-docker.pkg.dev/theitemapp/theitemapp/fleet-agent:latest}
@@ -41,13 +46,16 @@ services:
     network_mode: "service:tailscale"
     depends_on: [tailscale]
     environment:
+      # Agent OWNS networking: create fleet-net on the assigned /24, pin the uplink
+      # to <base>.2, attach it, and advertise the subnet in place.
+      FLEET_NET_ENABLED: "1"
+      FLEET_UPLINK_CONTAINER: fleet-tailscale
       # Host path of THIS repo (compose file + .env). The agent hands it to the
       # detached helper it spawns on an `updateAgent` command so the helper can
-      # `docker compose up -d agent` to recreate the agent from a freshly pulled
-      # image — control-plane-driven self-update, no node-side registry creds
-      # (this replaces the old watchtower sidecar, which couldn't use the agent's
-      # brokered auth). `${PWD}` resolves to the dir you run `docker compose` in;
-      # set FLEET_COMPOSE_DIR explicitly in .env if you run compose elsewhere.
+      # `docker compose up -d --no-deps agent` to recreate the agent from a freshly
+      # pulled image — control-plane-driven self-update, no node-side registry creds.
+      # `${PWD}` resolves to the dir you run `docker compose` in; set
+      # FLEET_COMPOSE_DIR explicitly in .env if you run compose elsewhere.
       FLEET_COMPOSE_DIR: ${FLEET_COMPOSE_DIR:-${PWD}}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -60,6 +68,8 @@ services:
     network_mode: host
     cap_add: [NET_ADMIN]
     environment:
+      # The uplink's pinned fleet-net IP (agent pins it to <base>.2). Set this to
+      # your node's <base>.2 in .env (e.g. 10.42.2.2) so host routes point at it.
       FLEET_TS_IP: ${FLEET_TS_IP:-10.42.0.2}
       FLEET_ROUTE_RANGES: ${FLEET_ROUTE_RANGES:-100.64.0.0/10 10.42.0.0/16}
     command:
@@ -73,13 +83,6 @@ services:
           sleep 30
         done
     restart: unless-stopped
-networks:
-  fleet-net:
-    name: fleet-net
-    driver: bridge
-    ipam:
-      config:
-        - subnet: ${FLEET_SUBNET:-10.42.0.0/24}
 volumes:
   tailscale-state:
   agent-id:
