@@ -1,88 +1,90 @@
-# Fleet node — clone, fill .env, `docker compose up -d`. That's the whole setup.
+# Fleet NODE bring-up — everything a managed Docker host needs, in code.
 #
-#   tailscale  — the UPLINK: joins the tailnet in kernel mode, accepts other
-#                nodes' routes, MagicDNS on. Stays on the DEFAULT bridge for its
-#                internet underlay; the agent attaches it to fleet-net + advertises.
-#   agent      — shares tailscale's netns; OWNS this node's networking
-#                (FLEET_NET_ENABLED): creates fleet-net on the control-plane /24,
-#                pins the uplink to <base>.2, advertises the subnet in place.
-#   router     — host routes so fleet-net containers can reach other nodes'
-#                subnets THROUGH the uplink (FLEET_TS_IP = the uplink's <base>.2).
+# Per-service Tailscale SIDECAR model: the node just joins the tailnet (a
+# kernel-mode uplink) and runs the agent. The agent receives deploy commands and
+# brings up each deployed service with its OWN ephemeral `tag:fleet` Tailscale
+# sidecar, reachable by MagicDNS. No subnet routing, no fleet-net, no route
+# approval — that older model is gone.
 #
-# fleet-net is NOT defined here on purpose — the agent owns it (creates/reconciles
-# it on the assigned subnet). Defining it in compose caused a hard label conflict
-# with the agent-created network. The agent advertises the route; approve it once
-# in the Tailscale admin (or an autoApprover ACL for tag:fleet over 10.42.0.0/16).
-name: fleet
+# Two containers:
+#   fleet-tailscale — puts the host on the tailnet in KERNEL mode (the uplink),
+#                     tagged `tag:fleet`, so the agent can reach the control
+#                     plane (fleet-control) by MagicDNS.
+#   fleet-agent     — shares fleet-tailscale's netns, mounts the Docker socket,
+#                     dials the control plane, and runs deploy/control commands
+#                     once the node is approved. Carries no platform secrets.
+#
+# Bring a node online:
+#   1. (first time) docker login the private Artifact Registry — see .env.example.
+#   2. cp .env.example .env   &&   edit .env (name, core URL, this node's auth key)
+#   3. docker compose up -d
+#   4. Approve the node in the Fleet UI.
+#
+# Update the agent later: the "Update agent" button on the node row (control-
+# plane-driven; no node-side registry creds needed).
+
 services:
-  tailscale:
+  # ── On the tailnet, in KERNEL mode — the UPLINK ────────────────────────────
+  # TS_USERSPACE=false is critical: userspace networking can't share the netns
+  # with the agent the way the sidecar model needs. Kernel mode brings up a real
+  # tailscale0 tun device. NET_ADMIN/NET_RAW + /dev/net/tun + ip_forward are what
+  # kernel mode needs; they are network-scoped, not host-root.
+  fleet-tailscale:
     image: tailscale/tailscale:latest
-    container_name: fleet-tailscale
     hostname: ${FLEET_NODE_NAME:?set FLEET_NODE_NAME in .env}
-    cap_add: [NET_ADMIN, NET_RAW]
-    devices: ["/dev/net/tun:/dev/net/tun"]
+    container_name: fleet-tailscale
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
     sysctls:
       net.ipv4.ip_forward: "1"
-      # Required for subnet-router return traffic to survive reverse-path
-      # filtering (tailscale sets this itself only if /proc/sys is writable —
-      # which it isn't at runtime; setting it here at create time makes it stick).
-      net.ipv4.conf.all.src_valid_mark: "1"
     environment:
       TS_USERSPACE: "false"
-      TS_AUTHKEY: ${FLEET_TS_AUTHKEY:?paste this node's Tailscale auth key in .env}
+      TS_AUTHKEY: ${FLEET_TS_AUTHKEY:?paste this node's Tailscale auth key into .env}
       TS_HOSTNAME: ${FLEET_NODE_NAME}
       TS_STATE_DIR: /var/lib/tailscale
       TS_ACCEPT_DNS: "true"
-      # No TS_ROUTES: the agent advertises the assigned fleet /24 (+ any extra
-      # routes) IN PLACE via `tailscale set`, so it self-heals on subnet changes.
-      TS_EXTRA_ARGS: --accept-routes
+      # Join the tailnet as a tagged device so the agent can reach the control
+      # plane (fleet-control) by MagicDNS. No subnet routes are advertised.
+      TS_EXTRA_ARGS: --advertise-tags=tag:fleet
     volumes:
-      - tailscale-state:/var/lib/tailscale
+      - fleet-tailscale-state:/var/lib/tailscale
     restart: unless-stopped
-  agent:
+
+  # ── The agent: dials the control plane THROUGH the tailnet ─────────────────
+  # Shares fleet-tailscale's netns, so its only route to the control plane is the
+  # tailnet. Mounts the Docker socket to manage this host. Carries no platform
+  # secrets, so the image is safe to pull onto any node.
+  fleet-agent:
     image: ${FLEET_AGENT_IMAGE:-europe-central2-docker.pkg.dev/theitemapp/theitemapp/fleet-agent:latest}
     pull_policy: always   # always fetch the newest agent on `up`
     container_name: fleet-agent
-    network_mode: "service:tailscale"
-    depends_on: [tailscale]
+    network_mode: service:fleet-tailscale
+    depends_on:
+      - fleet-tailscale
     environment:
-      # Agent OWNS networking: create fleet-net on the assigned /24, pin the uplink
-      # to <base>.2, attach it, and advertise the subnet in place.
-      FLEET_NET_ENABLED: "1"
-      FLEET_UPLINK_CONTAINER: fleet-tailscale
-      # Host path of THIS repo (compose file + .env). The agent hands it to the
-      # detached helper it spawns on an `updateAgent` command so the helper can
-      # `docker compose up -d --no-deps agent` to recreate the agent from a freshly
-      # pulled image — control-plane-driven self-update, no node-side registry creds.
-      # `${PWD}` resolves to the dir you run `docker compose` in; set
-      # FLEET_COMPOSE_DIR explicitly in .env if you run compose elsewhere.
+      # The compose service name the self-update helper recreates (this service).
+      FLEET_COMPOSE_SERVICE: fleet-agent
+      # Host path of THIS repo (compose + .env), handed to the detached helper
+      # that performs control-plane-driven self-update. ${PWD} = the dir you run
+      # `docker compose` in; set FLEET_COMPOSE_DIR in .env if you run from elsewhere.
       FLEET_COMPOSE_DIR: ${FLEET_COMPOSE_DIR:-${PWD}}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - agent-id:/data
-    command: ["--core-url", "${FLEET_CORE_URL:?set FLEET_CORE_URL in .env}", "--join-key", "${FLEET_JOIN_KEY:?set FLEET_JOIN_KEY in .env}", "--name", "${FLEET_NODE_NAME}"]
-    restart: unless-stopped
-  router:
-    image: alpine:3.20
-    container_name: fleet-router
-    network_mode: host
-    cap_add: [NET_ADMIN]
-    environment:
-      # The uplink's pinned fleet-net IP (agent pins it to <base>.2). Set this to
-      # your node's <base>.2 in .env (e.g. 10.42.2.2) so host routes point at it.
-      FLEET_TS_IP: ${FLEET_TS_IP:-10.42.0.2}
-      FLEET_ROUTE_RANGES: ${FLEET_ROUTE_RANGES:-100.64.0.0/10 10.42.0.0/16}
+      - fleet-agent-id:/data
     command:
-      - sh
-      - -c
-      - |
-        apk add --no-cache iproute2 >/dev/null 2>&1 || true
-        echo "fleet-router: routing [$$FLEET_ROUTE_RANGES] via $$FLEET_TS_IP"
-        while true; do
-          for r in $$FLEET_ROUTE_RANGES; do ip route replace "$$r" via "$$FLEET_TS_IP" 2>/dev/null || true; done
-          sleep 30
-        done
+      - --core-url
+      - ${FLEET_CORE_URL:?set FLEET_CORE_URL in .env (the control plane MagicDNS URL, e.g. http://fleet-control.tail28a9b4.ts.net:3012)}
+      - --join-key
+      - ${FLEET_JOIN_KEY:?set FLEET_JOIN_KEY in .env}
+      - --name
+      - ${FLEET_NODE_NAME}
     restart: unless-stopped
+
 volumes:
-  tailscale-state:
-  agent-id:
+  # Persists the Tailscale node identity → survives key expiry / restarts.
+  fleet-tailscale-state:
+  # Persists the agent's stable node id AND its issued per-node token.
+  fleet-agent-id:
