@@ -74,17 +74,6 @@ export interface RunContainerSpec {
   command?: string[];
   network?: string;
   pull?: boolean; // pull image before run (default true)
-  /**
-   * Run this container INSIDE another container's network namespace
-   * (`--network container:<name>`). Used for the per-node CORE EGRESS PROXY: a
-   * reverse-proxy that shares the Tailscale uplink's netns so it has real tailnet
-   * reach (MagicDNS + device/serve connectivity) AND is on the uplink's fleet-net
-   * IP — so same-host app containers reach it without any cross-host subnet
-   * routing (the only reliably-working cross-node primitive on every kernel,
-   * incl. WSL2). When set, the agent ignores `network`/`networks`/`ports` (the
-   * netns is shared and owned by the target container).
-   */
-  netnsOf?: string;
 }
 
 /**
@@ -99,21 +88,24 @@ export interface BundleServiceSpec extends RunContainerSpec {
   dependsOn?: string[];
   auth?: RegistryAuth;
   /**
-   * Explicit, control-plane-resolved network memberships (Stack-isolation epic).
-   * When present the agent attaches the container to `networks[0]` (its primary,
-   * with that entry's `ipv4`/`alias`) and `network connect`s the rest — instead
-   * of computing IPs itself. Every stack service is on its private `<stack>-net`;
-   * EXPOSED services additionally carry a `fleet-net` entry with a control-plane-
-   * allocated `ipv4`. Absent ⇒ agent falls back to the legacy single-`network` +
-   * self-assigned-IP behavior (rollout back-compat).
+   * When set, this service is reachable ACROSS THE FLEET on the tailnet via its
+   * own dedicated Tailscale sidecar (per-service identity). The control plane
+   * mints `authKey` (ephemeral, pre-authorized, `tag:fleet`) and assigns the
+   * stable MagicDNS `hostname` (e.g. `core-<id>` or `<app>-<node>`). The agent
+   * brings up `tailscale/tailscale` (kernel mode) as `<container>-ts` joined to
+   * the stack-private network under this service's `serviceName` alias, then runs
+   * the service in that sidecar's netns (`--network container:<sidecar>`).
+   * Siblings reach it by `serviceName`; other nodes by `<hostname>.<tailnet>.ts.net`.
+   * Absent ⇒ the service is private (runs directly on the stack network).
    */
-  networks?: Array<{ name: string; ipv4?: string; alias?: string }>;
+  tailnet?: { hostname: string; authKey: string };
   /**
-   * Whether THIS service publishes its ingress ports to the host. Replaces the
-   * bundle-level `isCore` gate so only a core's `web` (the node's `:80` front
-   * door) binds host ports, while the core's backend/mongo and all app services
-   * stay off the host. Absent ⇒ agent falls back to the bundle-level `isCore`
-   * rule.
+   * Whether THIS service publishes its ingress ports to the host. Only a core's
+   * `web` (the node's `:80` front door / public ingress) needs this; the core's
+   * backend/mongo and all app services stay off the host and are reached over the
+   * tailnet (exposed services) or the stack network (private). When the service
+   * has a `tailnet` sidecar the ports are published on the sidecar (the netns
+   * owner). Absent ⇒ falls back to the bundle-level `isCore` rule.
    */
   publishHost?: boolean;
 }
@@ -193,17 +185,4 @@ export interface PollResponse {
   // presents it as `x-fleet-node-token` on every later poll, so it stops
   // depending on the shared bootstrap join key. Absent on all subsequent polls.
   issuedToken?: string;
-  // The node's control-plane-assigned fleet network (Stage 3). The agent ensures
-  // a Docker network named `network.name` on the unique, non-overlapping
-  // `network.subnet`, places app bundles on it, and advertises that subnet to the
-  // tailnet via its Tailscale subnet-router — so the node never collides with
-  // another node's routes. Acted on only when FLEET_NET_ENABLED is set; absent
-  // until the control plane has allocated a subnet.
-  //
-  // `extraRoutes` are additional subnets this node must advertise alongside its
-  // fleet /24 (e.g. a co-located master core's docker net `172.18.0.0/16`). The
-  // agent advertises the UNION of `subnet` + `extraRoutes` + any node-local
-  // FLEET_EXTRA_ROUTES, so a node fronting a legacy net keeps it advertised while
-  // it also joins the fleet-net model. Optional; absent ⇒ just the /24.
-  network?: { name: string; subnet: string; extraRoutes?: string[] };
 }

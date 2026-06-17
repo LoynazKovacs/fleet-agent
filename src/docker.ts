@@ -16,9 +16,6 @@ export interface HostInfo {
   dockerVersion: string;
 }
 
-/** The shared, node-wide mesh network — never torn down with a single bundle. */
-const FLEET_NET_NAME = 'fleet-net';
-
 export class DockerClient {
   private readonly docker: Docker;
 
@@ -158,15 +155,9 @@ export class DockerClient {
     // keeps the registry out of the helper's path entirely; `--force-recreate`
     // guarantees the swap even if compose thinks nothing changed. The leading
     // sleep lets the current poll deliver this command's result before compose
-    // stops us.
-    // `--no-deps` is essential: the agent service shares the tailscale netns and
-    // does NOT attach fleet-net, but a plain `docker compose up agent` re-evaluates
-    // the project's networks and FAILS if fleet-net exists without compose's labels
-    // (the agent owns/reconciles fleet-net out of band, so it never carries them).
-    // That silent failure is why earlier self-updates "succeeded" yet never swapped
-    // the container. --no-deps scopes the recreate to just the agent, untouched by
-    // the network. The compose service name is overridable via FLEET_COMPOSE_SERVICE
-    // for composes that name it differently (default `agent`).
+    // stops us. `--no-deps` scopes the recreate to just the agent (the agent
+    // shares the uplink's netns; re-evaluating deps is unnecessary). The compose
+    // service name is overridable via FLEET_COMPOSE_SERVICE (default `agent`).
     const service = (process.env.FLEET_COMPOSE_SERVICE ?? 'agent').trim() || 'agent';
     const script = `sleep 6; cd "${composeDir}" && docker compose up -d --pull never --force-recreate --no-deps ${service}`;
     const helperName = `fleet-agent-updater-${Date.now().toString(36)}`;
@@ -191,106 +182,31 @@ export class DockerClient {
   /**
    * Create + start a single container from a run spec. Returns its id.
    *
-   * `opts.networkAlias` adds a DNS alias for the container on `spec.network` so
-   * a bundle's siblings can reach it by its service name even though its actual
-   * container name is the deterministic `<app>-<service>-<suffix>`.
-   *
-   * `opts.staticIp` pins the container to a known IPv4 on `spec.network` (so its
-   * reachable address is determinable at create time — used by the bundle path
-   * to resolve `${service.publicUrl}`). `opts.dns` overrides the container's DNS
-   * servers (the bundle path points these at the tailnet MagicDNS resolver so a
-   * deployed app can resolve core's serve name). Both are additive and only set
-   * by the bundle path — the plain single-container `run` path leaves them off.
+   * `opts.networkAlias` adds a DNS alias for the container on `spec.network` so a
+   * bundle's siblings can reach it by its service name even though its actual
+   * container name is the deterministic `<app>-<service>`.
    */
   async runContainer(
     spec: RunContainerSpec,
     auth?: RegistryAuth,
-    opts?: {
-      networkAlias?: string;
-      staticIp?: string;
-      dns?: string[];
-      publishHost?: boolean;
-      /**
-       * Control-plane-resolved network memberships (Stack-isolation epic). When
-       * set, the container is CREATED on `networks[0]` (with its alias/ipv4) and
-       * each remaining network is `connect`ed after start — so a service can be
-       * dual-homed (its private `<stack>-net` + `fleet-net`). Supersedes the
-       * legacy `networkAlias`/`staticIp` (single-network) path.
-       */
-      networks?: Array<{ name: string; ipv4?: string; alias?: string }>;
-    },
+    opts?: { networkAlias?: string; publishHost?: boolean },
   ): Promise<string> {
     if (spec.pull !== false) {
       await this.pullImage(spec.image, auth);
     }
 
     // Replace an existing container with the same name so deploy is idempotent.
-    if (spec.name) {
-      const existing = await this.findByName(spec.name);
-      if (existing) {
-        const c = this.docker.getContainer(existing.Id);
-        try {
-          await c.remove({ force: true });
-        } catch {
-          /* ignore */
-        }
-      }
-    }
+    await this.removeIfExists(spec.name);
 
-    // Netns-sharing path (core egress proxy): run inside the uplink container's
-    // network namespace. No docker networks, no published ports, no static IP —
-    // the container adopts the uplink's interfaces (fleet-net IP + tailnet reach).
-    if (spec.netnsOf) {
-      const target = await this.findByName(spec.netnsOf);
-      if (!target) throw new Error(`netnsOf target "${spec.netnsOf}" not found`);
-      const c = await this.docker.createContainer({
-        Image: spec.image,
-        name: spec.name,
-        Cmd: spec.command,
-        Env: spec.env ? Object.entries(spec.env).map(([k, v]) => `${k}=${v}`) : undefined,
-        HostConfig: {
-          NetworkMode: `container:${target.Id}`,
-          RestartPolicy: spec.restart && spec.restart !== 'no' ? { Name: spec.restart } : undefined,
-        },
-      });
-      await c.start();
-      return c.id.slice(0, 12);
-    }
-
-    // Host-publish gate: default true (the standalone `run` path keeps publishing),
-    // but the bundle path passes publishHost=false for non-core apps so they never
-    // bind a host port — they are reached on the fleet-net via their static IP and
-    // their bound core's Caddy. Container ports are still tracked (ExposedPorts) so
-    // the bundle's publicUrl/fleet-IP resolution is unaffected.
+    // Host-publish gate: default true (the standalone `run` path keeps publishing).
+    // Container ports are always declared (ExposedPorts) so in-network siblings can
+    // reach them; host PortBindings are added only when publishHost is set.
     const publishHost = opts?.publishHost ?? true;
-    const portBindings: Record<string, Array<{ HostPort: string }>> = {};
-    const exposedPorts: Record<string, Record<string, never>> = {};
-    for (const p of spec.ports ?? []) {
-      const key = `${p.container}/${p.protocol ?? 'tcp'}`;
-      exposedPorts[key] = {};
-      if (publishHost) portBindings[key] = [{ HostPort: String(p.host) }];
-    }
-
+    const { exposedPorts, portBindings } = buildPorts(spec.ports, publishHost);
     const binds = (spec.volumes ?? []).map((v) => `${v.host}:${v.container}${v.readOnly ? ':ro' : ''}`);
 
-    // Build the endpoint config for the container's PRIMARY network. Declarative
-    // `opts.networks` (control-plane-resolved) wins: the primary is networks[0],
-    // additional memberships are connected after start. Otherwise fall back to
-    // the legacy single-network `spec.network` + `networkAlias`/`staticIp`.
-    const makeEndpoint = (alias?: string, ipv4?: string): { Aliases?: string[]; IPAMConfig?: { IPv4Address: string } } => {
-      const ep: { Aliases?: string[]; IPAMConfig?: { IPv4Address: string } } = {};
-      if (alias) ep.Aliases = [alias];
-      if (ipv4) ep.IPAMConfig = { IPv4Address: ipv4 };
-      return ep;
-    };
-
-    const declarative = opts?.networks && opts.networks.length ? opts.networks : null;
-    const primaryNetName = declarative ? declarative[0].name : spec.network;
-    const primaryEndpoint = declarative
-      ? makeEndpoint(declarative[0].alias, declarative[0].ipv4)
-      : makeEndpoint(opts?.networkAlias, opts?.staticIp);
     const endpointsConfig =
-      primaryNetName && Object.keys(primaryEndpoint).length ? { [primaryNetName]: primaryEndpoint } : undefined;
+      spec.network && opts?.networkAlias ? { [spec.network]: { Aliases: [opts.networkAlias] } } : undefined;
 
     const container = await this.docker.createContainer({
       Image: spec.image,
@@ -301,157 +217,141 @@ export class DockerClient {
       HostConfig: {
         PortBindings: Object.keys(portBindings).length ? portBindings : undefined,
         Binds: binds.length ? binds : undefined,
-        NetworkMode: primaryNetName,
-        Dns: opts?.dns && opts.dns.length ? opts.dns : undefined,
+        NetworkMode: spec.network,
         RestartPolicy: spec.restart && spec.restart !== 'no' ? { Name: spec.restart } : undefined,
       },
       NetworkingConfig: endpointsConfig ? { EndpointsConfig: endpointsConfig } : undefined,
     });
     await container.start();
+    return container.id.slice(0, 12);
+  }
 
-    // Dual-home: connect every additional declarative network after start (a
-    // container can be created on only one network; the rest are joined here).
-    if (declarative && declarative.length > 1) {
-      for (const n of declarative.slice(1)) {
-        const ep = makeEndpoint(n.alias, n.ipv4);
-        await this.docker
-          .getNetwork(n.name)
-          .connect({ Container: container.id, EndpointConfig: Object.keys(ep).length ? ep : undefined });
-      }
-    }
+  /**
+   * Run a container that SHARES another container's network namespace
+   * (`--network container:<targetId>`). Used to place a service inside its
+   * Tailscale sidecar's netns so it inherits the sidecar's tailnet identity +
+   * stack-net membership. No own network, no published ports (the sidecar owns
+   * the netns and any host port bindings).
+   */
+  private async runContainerInNetns(spec: RunContainerSpec, targetId: string, auth?: RegistryAuth): Promise<string> {
+    if (spec.pull !== false) await this.pullImage(spec.image, auth);
+    await this.removeIfExists(spec.name);
+    const binds = (spec.volumes ?? []).map((v) => `${v.host}:${v.container}${v.readOnly ? ':ro' : ''}`);
+    const container = await this.docker.createContainer({
+      Image: spec.image,
+      name: spec.name,
+      Cmd: spec.command,
+      Env: spec.env ? Object.entries(spec.env).map(([k, v]) => `${k}=${v}`) : undefined,
+      HostConfig: {
+        NetworkMode: `container:${targetId}`,
+        Binds: binds.length ? binds : undefined,
+        RestartPolicy: spec.restart && spec.restart !== 'no' ? { Name: spec.restart } : undefined,
+      },
+    });
+    await container.start();
+    return container.id.slice(0, 12);
+  }
+
+  /**
+   * Bring up a per-service Tailscale SIDECAR: a `tailscale/tailscale` container
+   * (kernel mode) that joins the tailnet with an ephemeral, pre-authorized
+   * `tag:fleet` key (minted by the control plane) under a stable MagicDNS
+   * `hostname`. The service then runs in this sidecar's netns, so it gets its own
+   * tailnet identity and is reachable cross-node by `<hostname>.<tailnet>.ts.net`
+   * — no subnet routes, no approvals, works on every kernel incl. WSL2.
+   *
+   * The sidecar also joins the bundle's stack-private `network` under the
+   * service's `alias`, so co-located siblings still resolve it by serviceName,
+   * and the shared service can reach private siblings (mongo/engines). Host ports
+   * are published on the SIDECAR (the netns owner) only when `publishHost` is set
+   * (a core's `web` :80 front door). Idempotent: replaces an existing sidecar of
+   * the same name. Returns the sidecar container id.
+   */
+  private async ensureSidecar(opts: {
+    name: string;
+    hostname: string;
+    authKey: string;
+    network?: string;
+    alias?: string;
+    ports?: RunContainerSpec['ports'];
+    publishHost?: boolean;
+  }): Promise<string> {
+    await this.pullImage('tailscale/tailscale:latest');
+    await this.removeIfExists(opts.name);
+
+    const { exposedPorts, portBindings } = buildPorts(opts.ports, opts.publishHost ?? false);
+    const endpointsConfig =
+      opts.network && opts.alias ? { [opts.network]: { Aliases: [opts.alias] } } : undefined;
+
+    const container = await this.docker.createContainer({
+      Image: 'tailscale/tailscale:latest',
+      name: opts.name,
+      Hostname: opts.hostname,
+      Env: [
+        `TS_AUTHKEY=${opts.authKey}`,
+        `TS_HOSTNAME=${opts.hostname}`,
+        // Kernel mode (tailscale0 tun + MASQUERADE) is what makes a shared-netns
+        // service actually reachable on the tailnet; userspace mode cannot.
+        'TS_USERSPACE=false',
+        'TS_STATE_DIR=/var/lib/tailscale',
+        // Accept MagicDNS so the shared service can resolve OTHER fleet services'
+        // names for cross-node egress (e.g. an app's backend dialing its core).
+        'TS_ACCEPT_DNS=true',
+      ],
+      ExposedPorts: Object.keys(exposedPorts).length ? exposedPorts : undefined,
+      HostConfig: {
+        NetworkMode: opts.network,
+        PortBindings: Object.keys(portBindings).length ? portBindings : undefined,
+        CapAdd: ['NET_ADMIN', 'NET_RAW'],
+        Devices: [{ PathOnHost: '/dev/net/tun', PathInContainer: '/dev/net/tun', CgroupPermissions: 'rwm' }],
+        Sysctls: { 'net.ipv4.ip_forward': '1' },
+        RestartPolicy: { Name: 'unless-stopped' },
+      },
+      NetworkingConfig: endpointsConfig ? { EndpointsConfig: endpointsConfig } : undefined,
+    });
+    await container.start();
     return container.id.slice(0, 12);
   }
 
   /**
    * Deploy a whole multi-container app bundle as a unit.
    *
-   * Ensures the shared per-app network exists, then starts each service in
-   * `dependsOn` order: pull (with the service's own auth), replace any container
-   * of the same name (idempotent re-deploy), attach to the app network with a
-   * DNS alias of the service name so siblings resolve each other by name, and
-   * publish only the service's ingress ports. Partial-failure policy: best
-   * effort — every service is attempted, a failure is reported per-service, and
-   * already-started services are LEFT RUNNING (no rollback).
+   * Ensures the shared per-app private network, then starts each service in
+   * `dependsOn` order. A service flagged for tailnet exposure (`svc.tailnet`)
+   * gets its own Tailscale sidecar (its tailnet identity + MagicDNS name) and
+   * runs in that sidecar's netns; a private service (mongo/engine) runs directly
+   * on the stack network under its serviceName alias. Env placeholders are
+   * resolved by the control plane before dispatch — the agent runs env verbatim.
+   * Partial-failure policy: best effort — every service is attempted, failures
+   * are reported per-service, already-started services are left running.
    */
   async deployBundle(spec: BundleSpec): Promise<BundleServiceResult[]> {
-    // New-shape (Stack-isolation epic): the control plane resolved each service's
-    // network memberships + IPs + publishHost — apply them declaratively. An old
-    // control plane omits `networks[]` ⇒ fall back to the legacy self-IP path, so
-    // a NEW agent still serves an un-upgraded control plane during rollout.
-    const declarative = spec.services.some((s) => Array.isArray(s.networks) && s.networks.length > 0);
-    if (declarative) return this.deployBundleDeclarative(spec);
-    return this.deployBundleLegacy(spec);
-  }
-
-  /**
-   * Apply a control-plane-resolved bundle: ensure every referenced network, then
-   * start each service (dependsOn order) attached to its declared `networks[]`
-   * (private `<stack>-net` + optional `fleet-net` with an allocated IP), binding
-   * host ports only for services flagged `publishHost`. The agent computes NO IPs
-   * here — `${service.publicUrl}` and `FLEET_SERVICE_ENDPOINTS` were resolved by
-   * the control plane.
-   */
-  private async deployBundleDeclarative(spec: BundleSpec): Promise<BundleServiceResult[]> {
-    const networks = new Set<string>();
-    for (const svc of spec.services) for (const n of svc.networks ?? []) networks.add(n.name);
-    for (const n of networks) await this.ensureNetwork(n);
-
+    if (spec.networkName) await this.ensureNetwork(spec.networkName);
     const ordered = orderServicesByDependsOn(spec.services);
     const results: BundleServiceResult[] = [];
     for (const svc of ordered) {
       const containerName = svc.name ?? `${spec.appKey}-${svc.serviceName}`;
       try {
-        const id = await this.runContainer(
-          { ...svc, name: containerName, network: svc.networks?.[0]?.name },
-          svc.auth,
-          {
-            networks: svc.networks,
+        if (svc.tailnet) {
+          const sidecarName = `${containerName}-ts`;
+          const sidecarId = await this.ensureSidecar({
+            name: sidecarName,
+            hostname: svc.tailnet.hostname,
+            authKey: svc.tailnet.authKey,
+            network: spec.networkName,
+            alias: svc.serviceName,
+            ports: svc.ports,
             publishHost: svc.publishHost ?? spec.isCore === true,
-            // A core leads with a public resolver (Atlas SRV); an app leads with
-            // MagicDNS to reach its core's serve name, falling back to public.
-            dns: spec.isCore === true ? ['8.8.8.8', '100.100.100.100'] : ['100.100.100.100', '8.8.8.8'],
-          },
-        );
-        results.push({ serviceName: svc.serviceName, containerName, ok: true, containerId: id });
-      } catch (err) {
-        results.push({ serviceName: svc.serviceName, containerName, ok: false, error: (err as Error).message });
-      }
-    }
-    return results;
-  }
-
-  /** Legacy bundle deploy: single `networkName` + agent-assigned static IPs (pre-Stack-isolation control planes). */
-  private async deployBundleLegacy(spec: BundleSpec): Promise<BundleServiceResult[]> {
-    await this.ensureNetwork(spec.networkName);
-    // The fleet net's IPAM base (e.g. "10.42.0" from 10.42.0.0/24) — needed to
-    // assign deterministic static IPs to the bundle's services. Null if the
-    // network has no inspectable subnet: we then skip static IPs + the endpoints
-    // map and leave any `${service.publicUrl}` literal (best effort, never crash).
-    const subnetBase = await this.networkSubnetBase(spec.networkName);
-    const ordered = orderServicesByDependsOn(spec.services);
-    const results: BundleServiceResult[] = [];
-
-    // Assign a deterministic static fleet-net IP to EVERY service up front:
-    //  (a) each service becomes reachable from core at a known address (core's
-    //      Caddy proxies the frontend remote + api over the tailnet), and
-    //  (b) we can hand the registrant a `serviceName -> IP` map so its SDK can
-    //      rewrite manifest route upstreams (docker name → fleet IP).
-    // Index-based + dependsOn-ordered ⇒ stable across re-deploys: first service
-    // gets <base>.10, second <base>.11, … A null subnet (uninspectable network)
-    // ⇒ no static IPs and no endpoints map — co-located fallback where siblings
-    // still resolve each other by docker alias.
-    const ipByService = new Map<string, string>();
-    if (subnetBase) {
-      ordered.forEach((svc, i) => ipByService.set(svc.serviceName, `${subnetBase}.${10 + i}`));
-    }
-    const endpointsJson = ipByService.size
-      ? JSON.stringify(Object.fromEntries(ipByService))
-      : undefined;
-
-    for (const svc of ordered) {
-      const containerName = svc.name ?? `${spec.appKey}-${svc.serviceName}`;
-      try {
-        const staticIp = ipByService.get(svc.serviceName);
-        let env = svc.env;
-        if (env || endpointsJson) {
-          const next: Record<string, string> = { ...(env ?? {}) };
-          // Resolve this service's OWN `${service.publicUrl}` to its assigned IP
-          // (first exposed port is its ingress; host-only if it has no port).
-          if (staticIp) {
-            const port = svc.ports?.[0]?.container;
-            const publicUrl = port ? `http://${staticIp}:${port}` : `http://${staticIp}`;
-            for (const k of Object.keys(next)) {
-              next[k] = next[k].replaceAll('${service.publicUrl}', publicUrl);
-            }
-          }
-          // Hand every service the bundle's serviceName→fleet-IP map; the
-          // registrant's SDK uses it to rewrite manifest route upstreams.
-          // Harmless on non-registrant services.
-          if (endpointsJson) next.FLEET_SERVICE_ENDPOINTS = endpointsJson;
-          env = next;
-        }
-        const id = await this.runContainer(
-          { ...svc, name: containerName, network: spec.networkName, env },
-          svc.auth,
-          // DNS upstreams for the container's embedded resolver (sibling names
-          // always resolve via Docker's 127.0.0.11; these are the EXTERNAL
-          // upstreams it forwards to). A core talks to an external DB (e.g. Atlas
-          // `mongodb+srv://`, which needs a public SRV lookup) and never needs to
-          // resolve a tailnet `.ts.net` name, so it leads with a public resolver;
-          // MagicDNS (100.100.100.100) can't answer public SRV and would crash the
-          // core (ESERVFAIL). An app may need MagicDNS to reach its core's tailnet
-          // serve name, so it leads with that and falls back to public.
-          // static IP (when assigned) pins the address baked into publicUrl.
-          // Only a core publishes host ports (its web = the node's :80 front door);
-          // app bundles stay fleet-net-internal so they never squat the host's :80.
-          {
+          });
+          const id = await this.runContainerInNetns({ ...svc, name: containerName }, sidecarId, svc.auth);
+          results.push({ serviceName: svc.serviceName, containerName, ok: true, containerId: id });
+        } else {
+          const id = await this.runContainer({ ...svc, name: containerName, network: spec.networkName }, svc.auth, {
             networkAlias: svc.serviceName,
-            staticIp,
-            dns: spec.isCore === true ? ['8.8.8.8', '100.100.100.100'] : ['100.100.100.100', '8.8.8.8'],
-            publishHost: spec.isCore === true,
-          },
-        );
-        results.push({ serviceName: svc.serviceName, containerName, ok: true, containerId: id });
+            publishHost: svc.publishHost ?? false,
+          });
+          results.push({ serviceName: svc.serviceName, containerName, ok: true, containerId: id });
+        }
       } catch (err) {
         results.push({ serviceName: svc.serviceName, containerName, ok: false, error: (err as Error).message });
       }
@@ -460,48 +360,24 @@ export class DockerClient {
   }
 
   /**
-   * The first three octets of a network's IPAM subnet base (e.g. "10.42.0" from
-   * `10.42.0.0/24`), used to compute deterministic static IPs for bundle
-   * services. Returns null if the network is missing, has no IPAM config, or its
-   * subnet isn't a parseable IPv4 — callers then fall back to no static IP.
-   */
-  private async networkSubnetBase(name: string): Promise<string | null> {
-    try {
-      const net = (await this.docker.getNetwork(name).inspect()) as any;
-      const subnet: string | undefined = net?.IPAM?.Config?.[0]?.Subnet;
-      if (!subnet) return null;
-      const octets = subnet.split('/')[0]?.split('.') ?? [];
-      if (octets.length !== 4) return null;
-      return octets.slice(0, 3).join('.');
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Tear down a bundle as a unit: stop+remove each named container (tolerating
-   * any that are already gone, so remove is idempotent), then remove the shared
-   * network. The network removal is best-effort — left as-is if it is missing or
-   * still has other members attached.
+   * Tear down a bundle as a unit: stop+remove each named container AND its
+   * Tailscale sidecar (`<container>-ts`, if any) so an exposed service's ephemeral
+   * tailnet device disappears with it. Tolerates already-gone containers
+   * (idempotent), then removes the shared stack-private network (best-effort;
+   * left as-is if missing or still in use).
    */
   async removeBundle(spec: BundleRemoveSpec): Promise<BundleServiceResult[]> {
     const results: BundleServiceResult[] = [];
     for (const name of spec.containerNames) {
       try {
-        const existing = await this.findByName(name);
-        if (existing) {
-          await this.docker.getContainer(existing.Id).remove({ force: true });
-        }
-        // Absent container is a no-op success — removeApp is idempotent.
+        await this.removeIfExists(name);
+        await this.removeIfExists(`${name}-ts`); // its sidecar, if exposed
         results.push({ serviceName: '', containerName: name, ok: true });
       } catch (err) {
         results.push({ serviceName: '', containerName: name, ok: false, error: (err as Error).message });
       }
     }
-    // Remove the bundle's OWN (stack-private) network, but NEVER the shared
-    // fleet-net — other stacks/cores live on it. (Docker would also refuse while
-    // in use, but we guard explicitly so intent is clear.)
-    if (spec.networkName && spec.networkName !== FLEET_NET_NAME) {
+    if (spec.networkName) {
       try {
         await this.docker.getNetwork(spec.networkName).remove();
       } catch {
@@ -514,234 +390,9 @@ export class DockerClient {
   /** Create the per-app bridge network if it does not already exist. */
   private async ensureNetwork(name: string): Promise<void> {
     if (!name) return;
-    // fleet-net is owned by ensureFleetNetwork — it MUST carry the node's assigned
-    // /24 so control-plane-allocated IPs fit. Never create it here as a plain
-    // (default-subnet) bridge: a stray plain fleet-net created before Stage-3 ran
-    // is exactly what made `network connect <fleet-ip>` fail with "no configured
-    // subnet contains …". Leave it to ensureFleetNetwork (which reconciles it).
-    if (name === FLEET_NET_NAME) return;
     const nets = await this.docker.listNetworks();
     if (nets.some((n) => n.Name === name)) return;
     await this.docker.createNetwork({ Name: name, Driver: 'bridge' });
-  }
-
-  // ── Stage 3: fleet network + Tailscale subnet-router (gated by FLEET_NET_ENABLED) ──
-
-  /**
-   * Ensure the node's fleet network exists ON its control-plane-assigned subnet.
-   * Unlike the per-app network this is a single, stable, node-wide bridge whose
-   * subnet is unique across the fleet so the Tailscale subnet-router can advertise
-   * it without colliding with another node's routes.
-   *
-   * RECONCILES the subnet: if a `fleet-net` already exists but on the WRONG subnet
-   * (e.g. a plain default bridge created before Stage-3, or a stale subnet after a
-   * reassignment), it is recreated on the correct subnet — otherwise control-plane
-   * fleet IPs don't fit and `network connect` fails ("no configured subnet contains
-   * …"). Recreating means disconnecting current members (force); app bundles are
-   * reattached on their next (re)install and the subnet-router by ensureSubnetRouter
-   * which runs right after this. Docker can't resize a live network, so recreate is
-   * the only way to correct it.
-   */
-  async ensureFleetNetwork(name: string, subnet: string): Promise<void> {
-    if (!name || !subnet) return;
-    const nets = await this.docker.listNetworks();
-    const existing = nets.find((n) => n.Name === name);
-    if (existing) {
-      let current: string | undefined;
-      let memberIds: string[] = [];
-      try {
-        const inspected = (await this.docker.getNetwork(existing.Id).inspect()) as any;
-        current = inspected?.IPAM?.Config?.[0]?.Subnet;
-        memberIds = inspected?.Containers ? Object.keys(inspected.Containers) : [];
-      } catch {
-        return; // can't inspect — leave it alone
-      }
-      if (current === subnet) return; // already correct
-      // Wrong subnet — recreate. Disconnect every member first (Docker refuses to
-      // remove a network with attachments), then remove + recreate on the subnet.
-      for (const cid of memberIds) {
-        try {
-          await this.docker.getNetwork(existing.Id).disconnect({ Container: cid, Force: true });
-        } catch {
-          /* member already gone / not disconnectable — best effort */
-        }
-      }
-      try {
-        await this.docker.getNetwork(existing.Id).remove();
-      } catch {
-        return; // still in use / undeletable — bail rather than half-fix
-      }
-    }
-    await this.docker.createNetwork({
-      Name: name,
-      Driver: 'bridge',
-      IPAM: { Driver: 'default', Config: [{ Subnet: subnet }] },
-    });
-  }
-
-  /**
-   * Attach the node's existing Tailscale uplink container to `fleet-net` as a
-   * SECONDARY interface, so it can route inbound tailnet traffic into the app
-   * subnet WITHOUT owning the uplink's default route.
-   *
-   * This is the heart of the agent/fleet-net DECOUPLING (Stack-isolation epic):
-   * the uplink (`fleet-tailscale`, whose netns the agent shares) gets its default
-   * route + internet underlay from a dedicated `fleet-uplink` bridge, so the
-   * agent's reach to the tailnet-only control plane is INDEPENDENT of fleet-net.
-   * fleet-net is merely an extra leg used to forward to app containers. Docker
-   * keeps the default gateway on the container's PRIMARY network, so connecting
-   * fleet-net here never moves the default route — reconciling/recreating
-   * fleet-net only drops this secondary leg (re-added on the next poll), never the
-   * uplink that carries the agent's polling.
-   *
-   * Idempotent: a no-op when the container is already attached. Best-effort — a
-   * missing uplink (e.g. a non-net node) just means no inbound routing yet.
-   */
-  async ensureUplinkOnFleetNetwork(uplinkContainerName: string, networkName: string, ipv4?: string): Promise<boolean> {
-    if (!uplinkContainerName || !networkName) return false;
-    const info = await this.findByName(uplinkContainerName);
-    if (!info) return false; // uplink not up (yet) — try again next poll
-    let attached = false;
-    let currentIp: string | undefined;
-    try {
-      const inspected = (await this.docker.getContainer(info.Id).inspect()) as any;
-      const ep = inspected?.NetworkSettings?.Networks?.[networkName];
-      attached = !!ep;
-      currentIp = ep?.IPAMConfig?.IPv4Address || ep?.IPAddress;
-    } catch {
-      return false;
-    }
-    // Already attached at the desired (or any, if none requested) IP → done.
-    if (attached && (!ipv4 || currentIp === ipv4)) return true;
-    // Attached at the WRONG IP → reconnect at the pinned one so the egress proxy
-    // (which shares this netns) sits at a control-plane-known address.
-    if (attached && ipv4 && currentIp !== ipv4) {
-      try {
-        await this.docker.getNetwork(networkName).disconnect({ Container: info.Id, Force: true });
-      } catch {
-        return false;
-      }
-    }
-    try {
-      await this.docker.getNetwork(networkName).connect({
-        Container: info.Id,
-        EndpointConfig: ipv4 ? { IPAMConfig: { IPv4Address: ipv4 } } : undefined,
-      });
-      return true;
-    } catch {
-      return false; // network missing / transient — retried next poll
-    }
-  }
-
-  /**
-   * ADVERTISE a set of routes from the uplink, IN PLACE, via `tailscale set
-   * --advertise-routes` exec'd inside the uplink container — no recreate, so the
-   * agent (which shares the uplink's netns) is never knocked offline. This is the
-   * advertise-route SELF-HEAL: whenever the control plane reconciles the node to a
-   * new fleet-net subnet, the agent re-runs this and the advertised routes track
-   * it, with no re-auth (the uplink keeps its existing tailnet identity).
-   *
-   * `--advertise-routes` REPLACES the advertised set, so the caller must pass the
-   * FULL UNION it wants advertised (the node's fleet /24 PLUS any legacy routes it
-   * still fronts, e.g. a co-located master core's docker net `172.18.0.0/16`).
-   * Passing only the fleet subnet would silently drop those legacy routes and cut
-   * other nodes off from whatever they served — the exact "fix one, break another"
-   * this guards against. An empty list clears advertisements.
-   *
-   * `tailscale set` is idempotent on the tailscaled side, but the caller still
-   * tracks the last-applied set to avoid an exec every poll. `--accept-routes` is
-   * re-asserted so the node keeps reaching the subnets other nodes advertise.
-   * Returns true on a clean apply. Best-effort: a not-yet-ready tailscaled simply
-   * fails this poll and is retried.
-   */
-  async setAdvertisedRoutes(uplinkContainerName: string, routes: string[]): Promise<boolean> {
-    if (!uplinkContainerName) return false;
-    const info = await this.findByName(uplinkContainerName);
-    if (!info) return false;
-    try {
-      const exec = await this.docker.getContainer(info.Id).exec({
-        Cmd: ['tailscale', 'set', `--advertise-routes=${routes.join(',')}`, '--accept-routes'],
-        AttachStdout: true,
-        AttachStderr: true,
-      });
-      const stream = await exec.start({ Detach: false });
-      // Drain the exec output so the stream closes, then read the exit code.
-      await new Promise<void>((resolve) => {
-        stream.on('data', () => {});
-        stream.on('end', resolve);
-        stream.on('error', () => resolve());
-      });
-      const inspect = (await exec.inspect()) as any;
-      return inspect?.ExitCode === 0 || inspect?.ExitCode == null;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Ensure the node's Tailscale subnet-router container is running. It joins the
-   * tailnet with the node's (single-use) auth key, ADVERTISES the fleet subnet so
-   * the whole fleet network is reachable from other tailnet nodes, and ACCEPTS
-   * the routes other nodes advertise so containers here can reach them. Kernel
-   * routing needs NET_ADMIN + /dev/net/tun + ip_forward. Idempotent: replaces an
-   * existing router of the same name (e.g. on subnet change / restart).
-   *
-   * LEGACY / fallback path: used only when there is no shared-netns uplink to
-   * advertise from (e.g. a standalone subnet-router node). The DEFAULT canonical
-   * node now advertises in place from its uplink via `setAdvertisedRoutes` +
-   * `ensureUplinkOnFleetNetwork`, which keeps the agent's control-plane polling
-   * decoupled from fleet-net churn. Kept for back-compat with older bring-ups.
-   */
-  async ensureSubnetRouter(opts: {
-    containerName: string;
-    networkName: string;
-    hostname: string;
-    authKey: string;
-    subnet: string;
-    stateVolume: string;
-  }): Promise<string> {
-    await this.pullImage('tailscale/tailscale:latest');
-    const existing = await this.findByName(opts.containerName);
-    if (existing) {
-      try {
-        await this.docker.getContainer(existing.Id).remove({ force: true });
-      } catch {
-        /* ignore */
-      }
-    }
-    const container = await this.docker.createContainer({
-      Image: 'tailscale/tailscale:latest',
-      name: opts.containerName,
-      Hostname: opts.hostname,
-      Env: [
-        `TS_AUTHKEY=${opts.authKey}`,
-        `TS_HOSTNAME=${opts.hostname}`,
-        `TS_ROUTES=${opts.subnet}`,
-        // CRITICAL: the tailscale image DEFAULTS to userspace networking, which
-        // CANNOT subnet-route — advertise-routes is silently a no-op and pulls
-        // through the router time out. Forcing kernel mode (tailscale0 tun +
-        // MASQUERADE) is the one flag that makes routing actually work. Proven
-        // live 2026-06-12 (master + laptop); see docs/stage3-networking.
-        'TS_USERSPACE=false',
-        'TS_EXTRA_ARGS=--accept-routes --advertise-tags=tag:fleet',
-        'TS_STATE_DIR=/var/lib/tailscale',
-        'TS_ACCEPT_DNS=false',
-      ],
-      HostConfig: {
-        // Attach to the fleet network so the router can forward into it.
-        NetworkMode: opts.networkName,
-        // NET_ADMIN drives the routing tables; NET_RAW is needed by kernel-mode
-        // tailscaled for its netfilter/MASQUERADE rules. Both stay network-only
-        // (not host-root) — the security boundary is unchanged.
-        CapAdd: ['NET_ADMIN', 'NET_RAW'],
-        Devices: [{ PathOnHost: '/dev/net/tun', PathInContainer: '/dev/net/tun', CgroupPermissions: 'rwm' }],
-        Sysctls: { 'net.ipv4.ip_forward': '1' },
-        Binds: [`${opts.stateVolume}:/var/lib/tailscale`],
-        RestartPolicy: { Name: 'unless-stopped' },
-      },
-    });
-    await container.start();
-    return container.id.slice(0, 12);
   }
 
   async control(target: string, action: 'stop' | 'start' | 'restart' | 'remove'): Promise<void> {
@@ -754,10 +405,37 @@ export class DockerClient {
     else await container.remove({ force: true });
   }
 
+  /** Force-remove a container by name if present (idempotent helper). */
+  private async removeIfExists(name?: string): Promise<void> {
+    if (!name) return;
+    const existing = await this.findByName(name);
+    if (!existing) return;
+    try {
+      await this.docker.getContainer(existing.Id).remove({ force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+
   private async findByName(name: string): Promise<Docker.ContainerInfo | null> {
     const list = await this.docker.listContainers({ all: true });
     return list.find((c) => (c.Names ?? []).some((n) => n.replace(/^\//, '') === name)) ?? null;
   }
+}
+
+/** Build dockerode ExposedPorts + (optional) host PortBindings from a run spec. */
+function buildPorts(
+  ports: RunContainerSpec['ports'],
+  publishHost: boolean,
+): { exposedPorts: Record<string, Record<string, never>>; portBindings: Record<string, Array<{ HostPort: string }>> } {
+  const exposedPorts: Record<string, Record<string, never>> = {};
+  const portBindings: Record<string, Array<{ HostPort: string }>> = {};
+  for (const p of ports ?? []) {
+    const key = `${p.container}/${p.protocol ?? 'tcp'}`;
+    exposedPorts[key] = {};
+    if (publishHost) portBindings[key] = [{ HostPort: String(p.host) }];
+  }
+  return { exposedPorts, portBindings };
 }
 
 /**
