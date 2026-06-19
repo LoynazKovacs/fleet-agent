@@ -377,7 +377,11 @@ export class DockerClient {
         results.push({ serviceName: '', containerName: name, ok: false, error: (err as Error).message });
       }
     }
-    if (spec.networkName) {
+    // A co-located app ran on its core's SHARED network — never remove that; it
+    // belongs to the core (docker would refuse anyway while the core is attached,
+    // but skipping avoids a misleading error and a race if the core is momentarily
+    // down). Only remove a bundle's OWN per-app network.
+    if (spec.networkName && !spec.sharedNetwork) {
       try {
         await this.docker.getNetwork(spec.networkName).remove();
       } catch {

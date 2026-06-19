@@ -134,6 +134,13 @@ export interface BundleRemoveSpec {
   appKey: string;
   networkName: string;
   containerNames: string[];
+  /**
+   * True when the bundle ran on a SHARED network it does NOT own — a co-located
+   * app joined to its core's network. Teardown removes the containers but must
+   * NOT remove the network (it belongs to the core). Absent/false ⇒ this is the
+   * bundle's own per-app network and teardown removes it.
+   */
+  sharedNetwork?: boolean;
 }
 
 /** Per-service outcome of a bundle deploy, rolled up onto the deployment row. */
